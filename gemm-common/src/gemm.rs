@@ -982,12 +982,107 @@ macro_rules! __inject_mod_cplx {
     };
 }
 
+/// The size gate in front of the SME kernel: one `gemm_basic` that hands small calls to
+/// the NEON kernels and large ones to SME.
+///
+/// `$elem` is the element type of the signature (the complex instantiations pass the
+/// complex type, whose `gemm_basic` has the same shape), `$fallback` the NEON module to
+/// fall back to, `$sme_thresholds` the per-element-type table from
+/// [`crate::sme_thresholds`].
+#[macro_export]
+macro_rules! __inject_sme_gate {
+    ($elem: ident, $fallback: ident, $sme_thresholds: expr) => {
+        #[cfg(all(
+            target_arch = "aarch64",
+            target_vendor = "apple",
+            feature = "apple-sme"
+        ))]
+        mod sme_gate {
+            use super::*;
+
+            const THRESHOLDS: $crate::sme_thresholds::SmeThresholds = $sme_thresholds;
+
+            #[inline(never)]
+            pub unsafe fn gemm_basic(
+                m: usize,
+                n: usize,
+                k: usize,
+                dst: *mut $elem,
+                dst_cs: isize,
+                dst_rs: isize,
+                read_dst: bool,
+                lhs: *const $elem,
+                lhs_cs: isize,
+                lhs_rs: isize,
+                rhs: *const $elem,
+                rhs_cs: isize,
+                rhs_rs: isize,
+                alpha: $elem,
+                beta: $elem,
+                conj_dst: bool,
+                conj_lhs: bool,
+                conj_rhs: bool,
+                parallelism: $crate::Parallelism,
+            ) {
+                // The two kernels take the same arguments; only the cost differs, and the
+                // table in `sme_thresholds` says which one wins for this shape.
+                if THRESHOLDS.wants_sme(m, n, k) {
+                    super::sme::gemm_basic(
+                        m,
+                        n,
+                        k,
+                        dst,
+                        dst_cs,
+                        dst_rs,
+                        read_dst,
+                        lhs,
+                        lhs_cs,
+                        lhs_rs,
+                        rhs,
+                        rhs_cs,
+                        rhs_rs,
+                        alpha,
+                        beta,
+                        conj_dst,
+                        conj_lhs,
+                        conj_rhs,
+                        parallelism,
+                    )
+                } else {
+                    super::$fallback::gemm_basic(
+                        m,
+                        n,
+                        k,
+                        dst,
+                        dst_cs,
+                        dst_rs,
+                        read_dst,
+                        lhs,
+                        lhs_cs,
+                        lhs_rs,
+                        rhs,
+                        rhs_cs,
+                        rhs_rs,
+                        alpha,
+                        beta,
+                        conj_dst,
+                        conj_lhs,
+                        conj_rhs,
+                        parallelism,
+                    )
+                }
+            }
+        }
+    };
+}
+
 #[macro_export]
 macro_rules! gemm_def {
     // `$sme_gate` names the `HasAppleSme` probe that guards the SME microkernels: `get`
     // for the `f64` (`FMOPA za64.d`) kernel, `get_f32` for the `f32` (`FMOPA
-    // za32.s`) one.
-    ($ty: tt, $multiplier: expr, $sme_gate: ident) => {
+    // za32.s`) one. `$sme_thresholds` is that element type's measured
+    // [`gemm_common::sme_thresholds::SmeThresholds`] table.
+    ($ty: tt, $multiplier: expr, $sme_gate: ident, $sme_thresholds: expr) => {
         type GemmTy = unsafe fn(
             usize,
             usize,
@@ -1037,7 +1132,7 @@ macro_rules! gemm_def {
                         feature = "apple-sme"
                     ))]
                     if $crate::cache::HasAppleSme::$sme_gate() {
-                        return sme::gemm_basic;
+                        return sme_gate::gemm_basic;
                     }
                     #[cfg(feature = "experimental-apple-amx")]
                     if $crate::cache::HasAmx::get() {
@@ -1103,6 +1198,7 @@ macro_rules! gemm_def {
             feature = "apple-sme"
         ))]
         $crate::__inject_mod!(sme, $ty, 8 * $multiplier, Scalar, true);
+        $crate::__inject_sme_gate!($ty, neon, $sme_thresholds);
         #[cfg(target_arch = "aarch64")]
         #[cfg(feature = "experimental-apple-amx")]
         $crate::__inject_mod!(amx, $ty, 8 * $multiplier, Scalar, true);
@@ -1114,8 +1210,9 @@ macro_rules! gemm_def {
 
 #[macro_export]
 macro_rules! gemm_cplx_def {
-    // `$sme_gate` is the same per-element-type `HasAppleSme` probe as in `gemm_def!`.
-    ($ty: tt, $cplx_ty: tt, $multiplier: expr, $sme_gate: ident) => {
+    // `$sme_gate` is the same per-element-type `HasAppleSme` probe as in `gemm_def!`, and
+    // `$sme_thresholds` the matching `sme_thresholds` table.
+    ($ty: tt, $cplx_ty: tt, $multiplier: expr, $sme_gate: ident, $sme_thresholds: expr) => {
         type GemmCplxTy = unsafe fn(
             usize,
             usize,
@@ -1159,7 +1256,7 @@ macro_rules! gemm_cplx_def {
                     feature = "apple-sme"
                 ))]
                 if $crate::cache::HasAppleSme::$sme_gate() {
-                    return sme::gemm_basic;
+                    return sme_gate::gemm_basic;
                 }
                 if $crate::feature_detected!("neon") && $crate::feature_detected!("fcma") {
                     return neonfcma::gemm_basic;
@@ -1199,6 +1296,7 @@ macro_rules! gemm_cplx_def {
             feature = "apple-sme"
         ))]
         $crate::__inject_mod!(sme, $cplx_ty, 4 * $multiplier, Scalar, true);
+        $crate::__inject_sme_gate!($cplx_ty, neonfcma, $sme_thresholds);
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         $crate::__inject_mod_cplx!(fma, $ty, 2 * $multiplier, V3);

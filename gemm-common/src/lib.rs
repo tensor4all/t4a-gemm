@@ -33,6 +33,11 @@ pub mod microkernel;
 pub mod pack_operands;
 pub mod simd;
 
+// The measured size gate for the Apple SME kernels; `#[cfg]`-free so the constants can be
+// named from a `gemm_def!` invocation on any target (the gate itself is only generated on
+// aarch64 + Apple).
+pub mod sme_thresholds;
+
 pub use pulp;
 
 #[derive(Copy, Clone, Debug)]
