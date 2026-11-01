@@ -31,7 +31,7 @@ gemm-c64 = { package = "t4a-gemm-c64", version = "0.19.0", path = "../gemm-c64",
 gemm-f16 = { package = "t4a-gemm-f16", version = "0.19.0", path = "../gemm-f16", default-features = false, optional = true }
 
 [features]
-default = ["std", "rayon", "f16"]
+default = ["std", "rayon", "f16", "sme"]
 f16 = ["gemm-f16", "gemm-common/f16"]
 std = [
   "dyn-stack/std",
@@ -42,6 +42,7 @@ std = [
   "gemm-c64/std",
   "gemm-f16?/std",
 ]
+sme = ["gemm-f64/sme"]
 x86-v4 = [
   "gemm-common/x86-v4",
   "gemm-f32/x86-v4",

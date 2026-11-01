@@ -25,8 +25,11 @@ paste = { workspace = true }
 gemm-common = { package = "t4a-gemm-common", version = "0.19.0", default-features = false, path = "../gemm-common" }
 
 [features]
-default = ["std", "rayon"]
+default = ["std", "rayon", "sme"]
 std = ["dyn-stack/std", "gemm-common/std"]
 x86-v4 = ["gemm-common/x86-v4"]
 experimental-apple-amx = ["std", "gemm-common/experimental-apple-amx"]
 rayon = ["std", "gemm-common/rayon"]
+# Apple Scalable Matrix Extension microkernel (aarch64 + macOS >= 26 only);
+# the kernel needs `sysctl` for the runtime gate, so it implies `std`
+sme = ["std"]
