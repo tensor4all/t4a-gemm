@@ -453,23 +453,40 @@ pub mod amx {
 /// not supported.
 ///
 /// `fmopa za_t.d, p0/m, p1/m, z0.d, z_m.d` computes
-/// `ZA_t[i][j] += z0[i] * z_m[j]`, i.e. with `z0 = A[..][kk]` and `z_m = B[kk][8t..]`
-/// it accumulates `ZA_t[i][j] += A[i][kk] * B[kk][8t + j]`, which is a transposed
+/// `ZA_t[i][j] += z0[i] * z_m[j]`, i.e. with `z0 = A[..][kk]` and `z_m = B[kk][8c..]`
+/// it accumulates `ZA_t[i][j] += A[i][kk] * B[kk][8c + j]`, which is a transposed
 /// outer product: `ZA_t = A_panel^T @ B_panel`. Since `ZA` holds `svl/64 x svl/64`
 /// elements and `svl == 64` bytes here, one tile is exactly an `8 x 8` block of
-/// `dst`, with `i` running over `MR = 8` rows and `j` over 8 of the `NR = 32`
-/// columns.
+/// `dst`. The four `za64` tiles are laid out as a `2 x 2` grid of tiles, so one
+/// invocation computes an `MR = 16` by `NR = 16` block: `za0`/`za1` hold rows
+/// `0..8` (columns `0..8` and `8..16`), `za2`/`za3` rows `8..16`.
+///
+/// `MR = 16` (not 8) is deliberate: one column of the accumulator block is then
+/// `16 * 8 = 128` bytes, i.e. exactly one cache line, and the two 64 byte `st1d`
+/// halves of it are adjacent. With `MR = 8` every `st1d` writes only the low half
+/// of a line.
 ///
 /// Layout produced by `pack_operands` matches the instructions exactly:
-/// `MR = 8` contiguous `f64` per `k` step for the lhs (= one `Z` register) and
-/// `NR = 32` contiguous `f64` per `k` step for the rhs (= four `Z` registers), so
-/// the inner loop is four loads and four outer products per `k`.
+/// `MR = 16` contiguous `f64` per `k` step for the lhs (= two `Z` registers) and
+/// `NR = 16` contiguous `f64` per `k` step for the rhs (= two `Z` registers), so
+/// the inner loop is four loads and four outer products per `k`, and per `k` it
+/// loads `16 + 16 = 32` `f64` for `16 x 16` multiply-adds instead of the
+/// `8 + 32 = 40` `f64` an `8 x 32` block needs.
 ///
-/// The instruction words are emitted with `.inst` because
-/// `#[target_feature(enable = "sme")]` and the SME intrinsics are still unstable
-/// (rust-lang/rust#150244); every word is annotated with the instruction it encodes.
-/// `ZA` and streaming mode are enabled per call with `smstart`/`smstop`, which is
-/// what makes this safe to use from arbitrary threads: macOS saves the `ZA` and
+/// The epilogue (`dst := alpha * dst + beta * accum`) for a full block whose rows
+/// are contiguous in `dst` (`dst_rs == 1`) is fused into the same streaming-mode
+/// region and done with SVE `ld1d`/`fmul`/`fmla`/`st1d` on whole 8 element
+/// vectors, instead of the scalar read-modify-write loop. That is what makes small
+/// `k` fast: with `kc == k` the epilogue runs once per block and costs a large
+/// fraction of the `k` loop when `k` is short. Trailing panels (`m < MR`,
+/// `n < NR`) and a `dst` that is contiguous along the other axis keep the scalar
+/// loop, which needs no extra code path for partial vectors.
+///
+/// The instruction mnemonics are only accepted because of the `.arch` line: the
+/// SME intrinsics and `#[target_feature(enable = "sme")]` are still unstable
+/// (rust-lang/rust#150244), so the kernel is written as assembly. `ZA` and
+/// streaming mode are enabled per call with `smstart`/`smstop`, which is what
+/// makes this safe to use from arbitrary threads: macOS saves the `ZA` and
 /// streaming mode state on context switch (verified on macOS 26 / M5 Max).
 #[cfg(all(
     target_arch = "aarch64",
@@ -483,10 +500,10 @@ pub mod sme {
 
         /// `f64` lanes per `Z` register (as wide as one `ZA64` tile row).
         pub const N: usize = 8;
-        /// `Z` register writes per microkernel row panel: `MR = MR_DIV_N * N = 8`.
-        pub const MR_DIV_N: usize = 1;
+        /// `Z` register writes per microkernel row panel: `MR = MR_DIV_N * N = 16`.
+        pub const MR_DIV_N: usize = 2;
         /// Columns per microkernel invocation: four `ZA64` tiles.
-        pub const NR: usize = 32;
+        pub const NR: usize = 16;
 
         const MR: usize = MR_DIV_N * N;
 
@@ -503,74 +520,332 @@ pub mod sme {
         //
         // Defined in assembly (outside the inline-asm constraints) because the body
         // relies on ZA, on the streaming mode state `smstart` just enabled, on
-        // all-active predicate registers and on registers `x0`-`x7`/`x12` only; a
+        // all-active predicate registers and on registers `x0`-`x19` only; a
         // real function keeps that out of the compiler's register allocation.
+        //
+        // `x8` is the `alpha`/`beta` status (`0`: `dst = beta * accum`,
+        // `1`: `dst += beta * accum`, `2`: `dst = alpha * dst + beta * accum`) and
+        // `x9` tells the kernel whether the Rust side still has to run the epilogue
+        // (`0`) or the fused vector epilogue already did (`1`).
         core::arch::global_asm!(
             r#"
+            .arch   armv9-a+sme+sme-f64f64
             .globl  _t4a_gemm_f64_sme_ukr
             .p2align 4
             _t4a_gemm_f64_sme_ukr:
-                // x0 = k, x1 = lhs, x2 = rhs, x3 = lhs_step, x4 = rhs_step, x5 = accum
-                .inst 0xd503477f            // smstart
-                .inst 0xc00800ff            // zero {{za}}
-                .inst 0x25d8e3e0            // ptrue p0.d
-                .inst 0x25d8e3e1            // ptrue p1.d
+                // x0 = k, x1 = lhs, x2 = rhs, x3 = lhs_step, x4 = rhs_step,
+                // x5 = accum, x6 = dst, x7 = dst_cs (bytes), x8 = alpha status,
+                // x9 = fused epilogue, x10 = alpha bits, x11 = beta bits
+                smstart
+                zero    {{za}}
+                ptrue   p0.d
+                ptrue   p1.d
+                mov     x17, x5
             1:
-                .inst 0x85804020            // ldr z0, [x1]
-                .inst 0x85804041            // ldr z1, [x2]
-                .inst 0x85804442            // ldr z2, [x2, #1, mul vl]
-                .inst 0x85804843            // ldr z3, [x2, #2, mul vl]
-                .inst 0x85804c44            // ldr z4, [x2, #3, mul vl]
-                .inst 0x80c12000            // fmopa za0.d, p0/m, p1/m, z0.d, z1.d
-                .inst 0x80c22001            // fmopa za1.d, p0/m, p1/m, z0.d, z2.d
-                .inst 0x80c32002            // fmopa za2.d, p0/m, p1/m, z0.d, z3.d
-                .inst 0x80c42003            // fmopa za3.d, p0/m, p1/m, z0.d, z4.d
+                ldr     z0, [x1]                // A rows 0..8
+                ldr     z1, [x1, #1, mul vl]    // A rows 8..16
+                ldr     z2, [x2]                // B cols 0..8
+                ldr     z3, [x2, #1, mul vl]    // B cols 8..16
+                fmopa   za0.d, p0/m, p1/m, z0.d, z2.d
+                fmopa   za1.d, p0/m, p1/m, z0.d, z3.d
+                fmopa   za2.d, p0/m, p1/m, z1.d, z2.d
+                fmopa   za3.d, p0/m, p1/m, z1.d, z3.d
                 add     x1, x1, x3
                 add     x2, x2, x4
                 subs    x0, x0, #1
                 b.ne    1b
-                // spill one column (= MR f64) at a time; x5 walks the tile,
-                // x6 is the column stride, x7 counts the 8 columns, w12 is the slice
-                mov     x6, #64
-                mov     w12, #0
-                mov     x7, #8
+                // x9 selects the epilogue: `0` the Rust side does it, `1` the
+                // fused vector epilogue for a `dst` whose rows are contiguous
+                // (column major), `2` the fused epilogue for a `dst` whose
+                // columns are contiguous (row major). `alpha`/`beta` are
+                // broadcast first so that `x10`/`x11` are free below.
+                fmov    d0, x10
+                fmov    d1, x11
+                dup     z14.d, z0.d[0]          // alpha
+                dup     z15.d, z1.d[0]          // beta
+                mov     x11, x12                // dst row stride (bytes)
+                ptrue   p4.d, vl2               // one 16 B chunk of a dst row
+                cmp     x9, #2
+                b.eq    40f                     // row major dst does its own spill
+                // spill one column (= MR = 16 f64 = 128 B = one cache line) at a
+                // time: za0/za2 fill the two 64 B halves of that line, za1/za3 the
+                // line 1024 B further (columns 8..16 of the block). This layout is
+                // also what the Rust epilogue below reads, so it runs for `x9 == 0`
+                // as well.
+                add     x12, x5, #64
+                add     x13, x5, #1024
+                add     x14, x13, #64
+                mov     w15, #0
+                mov     w16, #8
             2:
-                .inst 0xe0ff80a0            // st1d {{za0v.d[w12, 0]}}, p0, [x5]
-                add     x5, x5, x6
-                add     w12, w12, #1
-                subs    x7, x7, #1
+                st1d    {{za0v.d[w15, 0]}}, p0, [x5]
+                st1d    {{za2v.d[w15, 0]}}, p0, [x12]
+                st1d    {{za1v.d[w15, 0]}}, p0, [x13]
+                st1d    {{za3v.d[w15, 0]}}, p0, [x14]
+                add     x5, x5, #128
+                add     x12, x12, #128
+                add     x13, x13, #128
+                add     x14, x14, #128
+                add     w15, w15, #1
+                subs    w16, w16, #1
                 b.ne    2b
-                mov     w12, #0
-                mov     x7, #8
+                cbz     x9, 9f                  // no fused epilogue: Rust does it
+                mov     w16, #16                // NR columns of the block
+                cmp     x8, #0
+                b.eq    6f
+                cmp     x8, #1
+                b.eq    5f
+                // status 2: dst = alpha * dst + beta * accum
             3:
-                .inst 0xe0ff80a2            // st1d {{za1v.d[w12, 0]}}, p0, [x5]
-                add     x5, x5, x6
-                add     w12, w12, #1
-                subs    x7, x7, #1
+                ld1d    z4.d, p0/z, [x17]
+                ld1d    z5.d, p0/z, [x17, #1, mul vl]
+                ld1d    z6.d, p0/z, [x6]
+                ld1d    z7.d, p0/z, [x6, #1, mul vl]
+                fmul    z6.d, p0/m, z6.d, z14.d
+                fmul    z7.d, p0/m, z7.d, z14.d
+                fmla    z6.d, p0/m, z4.d, z15.d
+                fmla    z7.d, p0/m, z5.d, z15.d
+                st1d    z6.d, p0, [x6]
+                st1d    z7.d, p0, [x6, #1, mul vl]
+                add     x17, x17, #128
+                add     x6, x6, x7
+                subs    w16, w16, #1
                 b.ne    3b
-                mov     w12, #0
-                mov     x7, #8
-            4:
-                .inst 0xe0ff80a4            // st1d {{za2v.d[w12, 0]}}, p0, [x5]
-                add     x5, x5, x6
-                add     w12, w12, #1
-                subs    x7, x7, #1
-                b.ne    4b
-                mov     w12, #0
-                mov     x7, #8
+                b       9f
+                // status 1: dst += beta * accum
             5:
-                .inst 0xe0ff80a6            // st1d {{za3v.d[w12, 0]}}, p0, [x5]
-                add     x5, x5, x6
-                add     w12, w12, #1
-                subs    x7, x7, #1
+                ld1d    z4.d, p0/z, [x17]
+                ld1d    z5.d, p0/z, [x17, #1, mul vl]
+                ld1d    z6.d, p0/z, [x6]
+                ld1d    z7.d, p0/z, [x6, #1, mul vl]
+                fmla    z6.d, p0/m, z4.d, z15.d
+                fmla    z7.d, p0/m, z5.d, z15.d
+                st1d    z6.d, p0, [x6]
+                st1d    z7.d, p0, [x6, #1, mul vl]
+                add     x17, x17, #128
+                add     x6, x6, x7
+                subs    w16, w16, #1
                 b.ne    5b
-                .inst 0xd503467f            // smstop
+                b       9f
+                // status 0: dst = beta * accum (dst is not read)
+            6:
+                ld1d    z4.d, p0/z, [x17]
+                ld1d    z5.d, p0/z, [x17, #1, mul vl]
+                fmul    z4.d, p0/m, z4.d, z15.d
+                fmul    z5.d, p0/m, z5.d, z15.d
+                st1d    z4.d, p0, [x6]
+                st1d    z5.d, p0, [x6, #1, mul vl]
+                add     x17, x17, #128
+                add     x6, x6, x7
+                subs    w16, w16, #1
+                b.ne    6b
+                b       9f
+                // Row major dst. Every `ZA64` tile row holds one column of the
+                // block, so a row major block is the transpose of what the
+                // column major spill produces. Rather than transposing (this SoC
+                // does not implement SVE gather/scatter - `ld1d`/`st1d` with a
+                // vector of byte offsets trap - so there is no cheap way to walk
+                // one accumulator row), the four tiles are spilled so that four
+                // neighbouring columns of one block row end up in 32 contiguous
+                // bytes: `st4d` interleaves the four MOVA'd columns at element
+                // granularity. A `dst` row is then four of those 32 B chunks,
+                // read and written as contiguous 32 B windows.
+            40:
+                mov     x16, x5                 // za0: rows 0..8,  columns 4q..
+                add     x7, x5, #512            // za1: rows 0..8,  columns 8+4q..
+                add     x9, x5, #1024           // za2: rows 8..16, columns 4q..
+                add     x10, x5, #1536          // za3: rows 8..16, columns 8+4q..
+                mov     w12, #0
+                mov     w13, #1
+                mov     w14, #2
+                mov     w15, #3
+                mov     x0, #2                  // two column quads per tile
+            41:
+                mova    z0.d, p0/m, za0v.d[w12, 0]
+                mova    z1.d, p0/m, za0v.d[w13, 0]
+                mova    z2.d, p0/m, za0v.d[w14, 0]
+                mova    z3.d, p0/m, za0v.d[w15, 0]
+                st4d    {{z0.d, z1.d, z2.d, z3.d}}, p0, [x16]
+                mova    z0.d, p0/m, za1v.d[w12, 0]
+                mova    z1.d, p0/m, za1v.d[w13, 0]
+                mova    z2.d, p0/m, za1v.d[w14, 0]
+                mova    z3.d, p0/m, za1v.d[w15, 0]
+                st4d    {{z0.d, z1.d, z2.d, z3.d}}, p0, [x7]
+                mova    z0.d, p0/m, za2v.d[w12, 0]
+                mova    z1.d, p0/m, za2v.d[w13, 0]
+                mova    z2.d, p0/m, za2v.d[w14, 0]
+                mova    z3.d, p0/m, za2v.d[w15, 0]
+                st4d    {{z0.d, z1.d, z2.d, z3.d}}, p0, [x9]
+                mova    z0.d, p0/m, za3v.d[w12, 0]
+                mova    z1.d, p0/m, za3v.d[w13, 0]
+                mova    z2.d, p0/m, za3v.d[w14, 0]
+                mova    z3.d, p0/m, za3v.d[w15, 0]
+                st4d    {{z0.d, z1.d, z2.d, z3.d}}, p0, [x10]
+                add     x16, x16, #256
+                add     x7, x7, #256
+                add     x9, x9, #256
+                add     x10, x10, #256
+                add     w12, w12, #4
+                add     w13, w13, #4
+                add     w14, w14, #4
+                add     w15, w15, #4
+                subs    x0, x0, #1
+                b.ne    41b
+                sub     x16, x16, #512
+                sub     x7, x7, #512
+                sub     x9, x9, #512
+                sub     x10, x10, #512
+                mov     w14, #2                 // rows 0..8, then rows 8..16
+                cmp     x8, #0
+                b.eq    60f
+                cmp     x8, #1
+                b.eq    50f
+                // status 2: dst = alpha * dst + beta * accum
+            42:
+                mov     w13, #8
+            43:
+                ldr     q0, [x16]
+                ldr     q1, [x16, #16]
+                ldr     q2, [x16, #256]
+                ldr     q3, [x16, #272]
+                ldr     q8, [x6, #0]
+                ldr     q9, [x6, #16]
+                ldr     q10, [x6, #32]
+                ldr     q11, [x6, #48]
+                fmul    z8.d, p4/m, z8.d, z14.d
+                fmul    z9.d, p4/m, z9.d, z14.d
+                fmul    z10.d, p4/m, z10.d, z14.d
+                fmul    z11.d, p4/m, z11.d, z14.d
+                fmla    z8.d, p4/m, z0.d, z15.d
+                fmla    z9.d, p4/m, z1.d, z15.d
+                fmla    z10.d, p4/m, z2.d, z15.d
+                fmla    z11.d, p4/m, z3.d, z15.d
+                str     q8, [x6, #0]
+                str     q9, [x6, #16]
+                str     q10, [x6, #32]
+                str     q11, [x6, #48]
+                ldr     q0, [x7]
+                ldr     q1, [x7, #16]
+                ldr     q2, [x7, #256]
+                ldr     q3, [x7, #272]
+                ldr     q8, [x6, #64]
+                ldr     q9, [x6, #80]
+                ldr     q10, [x6, #96]
+                ldr     q11, [x6, #112]
+                fmul    z8.d, p4/m, z8.d, z14.d
+                fmul    z9.d, p4/m, z9.d, z14.d
+                fmul    z10.d, p4/m, z10.d, z14.d
+                fmul    z11.d, p4/m, z11.d, z14.d
+                fmla    z8.d, p4/m, z0.d, z15.d
+                fmla    z9.d, p4/m, z1.d, z15.d
+                fmla    z10.d, p4/m, z2.d, z15.d
+                fmla    z11.d, p4/m, z3.d, z15.d
+                str     q8, [x6, #64]
+                str     q9, [x6, #80]
+                str     q10, [x6, #96]
+                str     q11, [x6, #112]
+                add     x16, x16, #32
+                add     x7, x7, #32
+                add     x6, x6, x11
+                subs    w13, w13, #1
+                b.ne    43b
+                add     x16, x16, #768
+                add     x7, x7, #768
+                subs    w14, w14, #1
+                b.ne    42b
+                b       9f
+                // status 1: dst += beta * accum
+            50:
+                mov     w13, #8
+            53:
+                ldr     q0, [x16]
+                ldr     q1, [x16, #16]
+                ldr     q2, [x16, #256]
+                ldr     q3, [x16, #272]
+                ldr     q8, [x6, #0]
+                ldr     q9, [x6, #16]
+                ldr     q10, [x6, #32]
+                ldr     q11, [x6, #48]
+                fmla    z8.d, p4/m, z0.d, z15.d
+                fmla    z9.d, p4/m, z1.d, z15.d
+                fmla    z10.d, p4/m, z2.d, z15.d
+                fmla    z11.d, p4/m, z3.d, z15.d
+                str     q8, [x6, #0]
+                str     q9, [x6, #16]
+                str     q10, [x6, #32]
+                str     q11, [x6, #48]
+                ldr     q0, [x7]
+                ldr     q1, [x7, #16]
+                ldr     q2, [x7, #256]
+                ldr     q3, [x7, #272]
+                ldr     q8, [x6, #64]
+                ldr     q9, [x6, #80]
+                ldr     q10, [x6, #96]
+                ldr     q11, [x6, #112]
+                fmla    z8.d, p4/m, z0.d, z15.d
+                fmla    z9.d, p4/m, z1.d, z15.d
+                fmla    z10.d, p4/m, z2.d, z15.d
+                fmla    z11.d, p4/m, z3.d, z15.d
+                str     q8, [x6, #64]
+                str     q9, [x6, #80]
+                str     q10, [x6, #96]
+                str     q11, [x6, #112]
+                add     x16, x16, #32
+                add     x7, x7, #32
+                add     x6, x6, x11
+                subs    w13, w13, #1
+                b.ne    53b
+                add     x16, x16, #768
+                add     x7, x7, #768
+                subs    w14, w14, #1
+                b.ne    50b
+                b       9f
+                // status 0: dst = beta * accum (dst is not read)
+            60:
+                mov     w13, #8
+            63:
+                ldr     q0, [x16]
+                ldr     q1, [x16, #16]
+                ldr     q2, [x16, #256]
+                ldr     q3, [x16, #272]
+                fmul    z0.d, p4/m, z0.d, z15.d
+                fmul    z1.d, p4/m, z1.d, z15.d
+                fmul    z2.d, p4/m, z2.d, z15.d
+                fmul    z3.d, p4/m, z3.d, z15.d
+                str     q0, [x6, #0]
+                str     q1, [x6, #16]
+                str     q2, [x6, #32]
+                str     q3, [x6, #48]
+                ldr     q0, [x7]
+                ldr     q1, [x7, #16]
+                ldr     q2, [x7, #256]
+                ldr     q3, [x7, #272]
+                fmul    z0.d, p4/m, z0.d, z15.d
+                fmul    z1.d, p4/m, z1.d, z15.d
+                fmul    z2.d, p4/m, z2.d, z15.d
+                fmul    z3.d, p4/m, z3.d, z15.d
+                str     q0, [x6, #64]
+                str     q1, [x6, #80]
+                str     q2, [x6, #96]
+                str     q3, [x6, #112]
+                add     x16, x16, #32
+                add     x7, x7, #32
+                add     x6, x6, x11
+                subs    w13, w13, #1
+                b.ne    63b
+                add     x16, x16, #768
+                add     x7, x7, #768
+                subs    w14, w14, #1
+                b.ne    60b
+            9:
+                smstop
                 ret
             "#
         );
 
         extern "C" {
-            /// Computes the `MR x NR` accumulator block into `accum`.
+            /// Computes the `MR x NR` accumulator block into `accum` and, when
+            /// `fused != 0`, also applies `dst := alpha * dst + beta * accum`.
             fn t4a_gemm_f64_sme_ukr(
                 k: usize,
                 lhs: *const T,
@@ -578,6 +853,12 @@ pub mod sme {
                 lhs_step: usize,
                 rhs_step: usize,
                 accum: *mut T,
+                dst: *mut T,
+                dst_cs: usize,
+                alpha_status: usize,
+                fused: usize,
+                alpha: u64,
+                beta: u64,
             );
         }
 
@@ -611,10 +892,28 @@ pub mod sme {
 
             let mut accum = [0.0 as T; MR * NR];
 
-            // The callee clobbers the volatile SIMD registers (`z0`-`z4` alias
-            // `v0`-`v4`, which the caller uses for `alpha`/`beta`), so the call goes
+            // A full block is written by the fused epilogue: `1` when the rows are
+            // contiguous in `dst` (column major, `dst_rs == 1`), `2` when the
+            // columns are (row major, `dst_cs == 1`). The trailing partial panels,
+            // and a `dst` that is contiguous along neither axis, keep the scalar
+            // loop below, which needs no per-element bounds handling.
+            let epilogue = if m == MR && n == NR {
+                if dst_rs == 1 {
+                    1
+                } else if dst_cs == 1 {
+                    2
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+
+            // The callee clobbers the volatile SIMD registers (`z0`-`z7` alias
+            // `v0`-`v7`, which the caller uses for `alpha`/`beta`), so the call goes
             // through `asm!` with an explicit clobber list instead of a plain
-            // `extern "C"` call.
+            // `extern "C"` call. `alpha`/`beta` travel as bit patterns in `x10`/`x11`
+            // because `z0` is both a clobber and the register the broadcast reads.
             core::arch::asm!(
                 "bl {ukr}",
                 ukr = sym t4a_gemm_f64_sme_ukr,
@@ -624,15 +923,36 @@ pub mod sme {
                 in("x3") (lhs_cs * core::mem::size_of::<T>() as isize) as usize,
                 in("x4") (rhs_rs * core::mem::size_of::<T>() as isize) as usize,
                 in("x5") accum.as_mut_ptr(),
+                in("x6") dst,
+                in("x7") (dst_cs * core::mem::size_of::<T>() as isize) as usize,
+                in("x8") alpha_status as usize,
+                in("x9") epilogue as usize,
+                in("x10") alpha.to_bits(),
+                in("x11") beta.to_bits(),
+                in("x12") (dst_rs * core::mem::size_of::<T>() as isize) as usize,
                 out("z0") _,
                 out("z1") _,
                 out("z2") _,
                 out("z3") _,
                 out("z4") _,
+                out("z5") _,
+                out("z6") _,
+                out("z7") _,
+                out("z8") _,
+                out("z9") _,
+                out("z10") _,
+                out("z11") _,
+                out("z14") _,
+                out("z15") _,
                 out("p0") _,
                 out("p1") _,
+                out("p4") _,
                 clobber_abi("C"),
             );
+
+            if epilogue != 0 {
+                return;
+            }
 
             // dst := alpha * dst + beta * accum
             match alpha_status {
@@ -664,7 +984,6 @@ pub mod sme {
         }
     }
 }
-
 #[cfg(target_arch = "wasm32")]
 pub mod simd128 {
     pub mod f64 {
