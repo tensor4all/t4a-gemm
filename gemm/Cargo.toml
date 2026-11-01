@@ -42,7 +42,7 @@ std = [
   "gemm-c64/std",
   "gemm-f16?/std",
 ]
-sme = ["gemm-f64/sme"]
+sme = ["gemm-f64/sme", "gemm-f32/sme", "gemm-c32/sme", "gemm-c64/sme"]
 x86-v4 = [
   "gemm-common/x86-v4",
   "gemm-f32/x86-v4",
