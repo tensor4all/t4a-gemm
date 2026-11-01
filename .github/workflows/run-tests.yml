@@ -37,8 +37,13 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      # `diol` (a dev-dependency of the `gemm` tests) links fontconfig on Linux.
+      - name: Install Linux test dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev pkg-config
+
       - name: Collect coverage data
-        run: cargo llvm-cov nextest --lcov --output-path lcov.info --package gemm
+        run: cargo llvm-cov nextest --lcov --output-path lcov.info --package t4a-gemm
 
       - name: Upload coverage data to codecov
         uses: codecov/codecov-action@v3
