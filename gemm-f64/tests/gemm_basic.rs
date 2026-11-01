@@ -31,6 +31,18 @@ fn reference(
 }
 
 fn check(m: usize, n: usize, k: usize, alpha: f64, beta: f64, colmajor: bool) {
+    check_par(m, n, k, alpha, beta, colmajor, Parallelism::None);
+}
+
+fn check_par(
+    m: usize,
+    n: usize,
+    k: usize,
+    alpha: f64,
+    beta: f64,
+    colmajor: bool,
+    parallelism: Parallelism,
+) {
     let lhs: Vec<f64> = (0..m * k).map(|i| (i % 17) as f64 / 8.0 - 1.0).collect();
     let rhs: Vec<f64> = (0..k * n).map(|i| (i % 13) as f64 / 8.0 - 0.5).collect();
     let init: Vec<f64> = (0..m * n).map(|i| (i % 7) as f64 / 16.0).collect();
@@ -64,7 +76,7 @@ fn check(m: usize, n: usize, k: usize, alpha: f64, beta: f64, colmajor: bool) {
             false,
             false,
             false,
-            Parallelism::None,
+            parallelism,
         );
     }
     reference(m, n, k, &lhs, &rhs, &mut want, dst_cs, dst_rs, alpha, beta);
@@ -101,6 +113,63 @@ fn matches_reference() {
         for (alpha, beta) in coeffs {
             for colmajor in [true, false] {
                 check(m, n, k, alpha, beta, colmajor);
+            }
+        }
+    }
+}
+
+/// The `MR = 16`, `NR = 16` SME microkernel has three epilogue paths: full blocks
+/// (`m == 16 && n == 16`, which is fused into the streaming-mode region), row and
+/// column partial panels, and a `dst` that is contiguous along the column axis
+/// instead of the row axis. Sweep the panel boundaries on both layouts.
+#[test]
+fn matches_reference_at_panel_boundaries() {
+    let shapes = [
+        (15, 15, 1),
+        (16, 16, 1),
+        (16, 16, 2),
+        (15, 16, 3),
+        (16, 15, 4),
+        (17, 16, 5),
+        (16, 17, 6),
+        (1, 16, 2),
+        (16, 1, 2),
+        (31, 32, 7),
+        (32, 31, 8),
+        (32, 32, 9),
+        (33, 16, 5),
+        (16, 33, 5),
+        (48, 48, 11),
+        (49, 47, 3),
+    ];
+    let coeffs = [(1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0), (2.3, 2.3)];
+
+    for (m, n, k) in shapes {
+        for (alpha, beta) in coeffs {
+            for colmajor in [true, false] {
+                check(m, n, k, alpha, beta, colmajor);
+            }
+        }
+    }
+}
+
+/// Same contract through the `rayon` job-splitting path, so the fused epilogue is
+/// also exercised on partial jobs (a `k` large enough to need several `k` chunks
+/// and an `m` large enough to be split into several row panels).
+#[cfg(feature = "rayon")]
+#[test]
+fn matches_reference_parallel() {
+    let coeffs = [(1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (2.3, 2.3)];
+    for (m, n, k) in [
+        (64, 64, 64),
+        (37, 45, 11),
+        (128, 128, 520),
+        (17, 33, 513),
+        (200, 16, 100),
+    ] {
+        for (alpha, beta) in coeffs {
+            for colmajor in [true, false] {
+                check_par(m, n, k, alpha, beta, colmajor, Parallelism::Rayon(3));
             }
         }
     }
