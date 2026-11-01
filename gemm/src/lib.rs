@@ -22,8 +22,12 @@ mod tests {
     use super::*;
     extern crate alloc;
     use alloc::{vec, vec::Vec};
+    #[cfg(feature = "f16")]
     use num_traits::Float;
 
+    // The `f16` element type (and its `from_f32`) only exists with the `f16`
+    // feature, so the test must not be compiled without it.
+    #[cfg(feature = "f16")]
     #[test]
     fn test_gemm_f16() {
         let mut mnks = vec![];
