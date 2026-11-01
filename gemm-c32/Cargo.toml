@@ -1,13 +1,18 @@
 [package]
-name = "gemm-c32"
+name = "t4a-gemm-c32"
 version = "0.19.0"
 edition = "2021"
 authors = ["sarah <>"]
 description = "Playground for matrix multiplication algorithms"
 readme = "../README.md"
-repository = "https://github.com/sarah-ek/gemm/"
+repository = "https://github.com/tensor4all/t4a-gemm"
+homepage = "https://github.com/tensor4all/t4a-gemm"
+documentation = "https://github.com/tensor4all/t4a-gemm"
 license = "MIT"
 keywords = ["linear-algebra"]
+
+[lib]
+name = "gemm_c32"
 
 [dependencies]
 raw-cpuid = { workspace = true }
@@ -17,7 +22,7 @@ num-traits = { workspace = true, default-features = false }
 num-complex = { workspace = true, default-features = false }
 paste = { workspace = true }
 
-gemm-common = { version = "0.19.0", default-features = false, path = "../gemm-common" }
+gemm-common = { package = "t4a-gemm-common", version = "0.19.0", default-features = false, path = "../gemm-common" }
 
 [features]
 default = ["std", "rayon"]
