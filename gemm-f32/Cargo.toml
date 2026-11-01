@@ -1,6 +1,6 @@
 [package]
 name = "t4a-gemm-f32"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2021"
 authors = ["sarah <>"]
 description = "Playground for matrix multiplication algorithms -- tensor4all fork: adds an Apple Silicon SME (aarch64 + macOS 26) path, everything else is upstream code"
@@ -22,7 +22,7 @@ num-traits = { workspace = true, default-features = false }
 num-complex = { workspace = true, default-features = false }
 paste = { workspace = true }
 
-gemm-common = { package = "t4a-gemm-common", version = "0.19.0", default-features = false, path = "../gemm-common" }
+gemm-common = { package = "t4a-gemm-common", version = "0.20.0", default-features = false, path = "../gemm-common" }
 
 [features]
 default = ["std", "rayon", "apple-sme"]
