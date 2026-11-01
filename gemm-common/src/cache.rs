@@ -707,8 +707,26 @@ pub fn kernel_params(
     let c_lhs = (mr * sizeof) / gcd;
     let c_rhs = (nr * kc_0 * sizeof) / (l1_line_bytes * l1_n_sets);
     let kc_multiplier = l1_assoc / (c_lhs + c_rhs);
-    // let auto_kc = kc_0 * kc_multiplier;
-    let auto_kc = (kc_0 * kc_multiplier.next_power_of_two()).max(512).min(k);
+    // `kc` decides how many `k` chunks a block is walked in, and every chunk costs
+    // a microkernel call plus a read-modify-write pass over the `MC x NC` block,
+    // which outweighs the L1 panel re-reads the set-conflict formula above trades
+    // against. On an Apple M5 Max with the f64 SME kernel one extra chunk measured
+    // ~0.16 us (n = 2048, k = 2048, 1T: 4 chunks of 512 = 2.99 us per block, one
+    // chunk = 2.51 us), i.e. ~20% of a `kc == 512` block; raising `kc` to 1024 /
+    // to all of `k` measured +6..19% / +16..20% at k == 2048, and nothing loses.
+    // The bound on the other side is that one panel pair must fit in L2: the `A`
+    // macropanel is at most `8 * mr` rows (the `mc` clamp below) and the `B`
+    // micropanel is `nr` wide, so that is `sizeof * (8 * mr + nr)` bytes per
+    // element of `kc`.
+    let kc_l2 = if l2_cache_bytes == 0 {
+        0
+    } else {
+        l2_cache_bytes / (sizeof * (8 * mr + nr))
+    };
+    let auto_kc = (kc_0 * kc_multiplier.next_power_of_two())
+        .max(512)
+        .max(kc_l2)
+        .min(k);
     let k_iter = k.msrv_div_ceil(auto_kc);
     let auto_kc = k.msrv_div_ceil(k_iter);
 

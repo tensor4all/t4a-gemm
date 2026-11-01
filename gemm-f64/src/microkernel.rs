@@ -554,9 +554,24 @@ pub mod sme {
                 add     x2, x2, x4
                 subs    x0, x0, #1
                 b.ne    1b
+                // x9 selects the epilogue: `0` the Rust side does it, `1` the
+                // fused vector epilogue for a `dst` whose rows are contiguous
+                // (column major), `2` the fused epilogue for a `dst` whose
+                // columns are contiguous (row major). `alpha`/`beta` are
+                // broadcast first so that `x10`/`x11` are free below.
+                fmov    d0, x10
+                fmov    d1, x11
+                dup     z14.d, z0.d[0]          // alpha
+                dup     z15.d, z1.d[0]          // beta
+                mov     x11, x12                // dst row stride (bytes)
+                ptrue   p4.d, vl2               // one 16 B chunk of a dst row
+                cmp     x9, #2
+                b.eq    40f                     // row major dst does its own spill
                 // spill one column (= MR = 16 f64 = 128 B = one cache line) at a
                 // time: za0/za2 fill the two 64 B halves of that line, za1/za3 the
-                // line 1024 B further (columns 8..16 of the block)
+                // line 1024 B further (columns 8..16 of the block). This layout is
+                // also what the Rust epilogue below reads, so it runs for `x9 == 0`
+                // as well.
                 add     x12, x5, #64
                 add     x13, x5, #1024
                 add     x14, x13, #64
@@ -575,10 +590,6 @@ pub mod sme {
                 subs    w16, w16, #1
                 b.ne    2b
                 cbz     x9, 9f                  // no fused epilogue: Rust does it
-                fmov    d0, x10
-                fmov    d1, x11
-                dup     z14.d, z0.d[0]          // alpha
-                dup     z15.d, z1.d[0]          // beta
                 mov     w16, #16                // NR columns of the block
                 cmp     x8, #0
                 b.eq    6f
@@ -628,6 +639,204 @@ pub mod sme {
                 add     x6, x6, x7
                 subs    w16, w16, #1
                 b.ne    6b
+                b       9f
+                // Row major dst. Every `ZA64` tile row holds one column of the
+                // block, so a row major block is the transpose of what the
+                // column major spill produces. Rather than transposing (this SoC
+                // does not implement SVE gather/scatter - `ld1d`/`st1d` with a
+                // vector of byte offsets trap - so there is no cheap way to walk
+                // one accumulator row), the four tiles are spilled so that four
+                // neighbouring columns of one block row end up in 32 contiguous
+                // bytes: `st4d` interleaves the four MOVA'd columns at element
+                // granularity. A `dst` row is then four of those 32 B chunks,
+                // read and written as contiguous 32 B windows.
+            40:
+                mov     x16, x5                 // za0: rows 0..8,  columns 4q..
+                add     x7, x5, #512            // za1: rows 0..8,  columns 8+4q..
+                add     x9, x5, #1024           // za2: rows 8..16, columns 4q..
+                add     x10, x5, #1536          // za3: rows 8..16, columns 8+4q..
+                mov     w12, #0
+                mov     w13, #1
+                mov     w14, #2
+                mov     w15, #3
+                mov     x0, #2                  // two column quads per tile
+            41:
+                mova    z0.d, p0/m, za0v.d[w12, 0]
+                mova    z1.d, p0/m, za0v.d[w13, 0]
+                mova    z2.d, p0/m, za0v.d[w14, 0]
+                mova    z3.d, p0/m, za0v.d[w15, 0]
+                st4d    {{z0.d, z1.d, z2.d, z3.d}}, p0, [x16]
+                mova    z0.d, p0/m, za1v.d[w12, 0]
+                mova    z1.d, p0/m, za1v.d[w13, 0]
+                mova    z2.d, p0/m, za1v.d[w14, 0]
+                mova    z3.d, p0/m, za1v.d[w15, 0]
+                st4d    {{z0.d, z1.d, z2.d, z3.d}}, p0, [x7]
+                mova    z0.d, p0/m, za2v.d[w12, 0]
+                mova    z1.d, p0/m, za2v.d[w13, 0]
+                mova    z2.d, p0/m, za2v.d[w14, 0]
+                mova    z3.d, p0/m, za2v.d[w15, 0]
+                st4d    {{z0.d, z1.d, z2.d, z3.d}}, p0, [x9]
+                mova    z0.d, p0/m, za3v.d[w12, 0]
+                mova    z1.d, p0/m, za3v.d[w13, 0]
+                mova    z2.d, p0/m, za3v.d[w14, 0]
+                mova    z3.d, p0/m, za3v.d[w15, 0]
+                st4d    {{z0.d, z1.d, z2.d, z3.d}}, p0, [x10]
+                add     x16, x16, #256
+                add     x7, x7, #256
+                add     x9, x9, #256
+                add     x10, x10, #256
+                add     w12, w12, #4
+                add     w13, w13, #4
+                add     w14, w14, #4
+                add     w15, w15, #4
+                subs    x0, x0, #1
+                b.ne    41b
+                sub     x16, x16, #512
+                sub     x7, x7, #512
+                sub     x9, x9, #512
+                sub     x10, x10, #512
+                mov     w14, #2                 // rows 0..8, then rows 8..16
+                cmp     x8, #0
+                b.eq    60f
+                cmp     x8, #1
+                b.eq    50f
+                // status 2: dst = alpha * dst + beta * accum
+            42:
+                mov     w13, #8
+            43:
+                ldr     q0, [x16]
+                ldr     q1, [x16, #16]
+                ldr     q2, [x16, #256]
+                ldr     q3, [x16, #272]
+                ldr     q8, [x6, #0]
+                ldr     q9, [x6, #16]
+                ldr     q10, [x6, #32]
+                ldr     q11, [x6, #48]
+                fmul    z8.d, p4/m, z8.d, z14.d
+                fmul    z9.d, p4/m, z9.d, z14.d
+                fmul    z10.d, p4/m, z10.d, z14.d
+                fmul    z11.d, p4/m, z11.d, z14.d
+                fmla    z8.d, p4/m, z0.d, z15.d
+                fmla    z9.d, p4/m, z1.d, z15.d
+                fmla    z10.d, p4/m, z2.d, z15.d
+                fmla    z11.d, p4/m, z3.d, z15.d
+                str     q8, [x6, #0]
+                str     q9, [x6, #16]
+                str     q10, [x6, #32]
+                str     q11, [x6, #48]
+                ldr     q0, [x7]
+                ldr     q1, [x7, #16]
+                ldr     q2, [x7, #256]
+                ldr     q3, [x7, #272]
+                ldr     q8, [x6, #64]
+                ldr     q9, [x6, #80]
+                ldr     q10, [x6, #96]
+                ldr     q11, [x6, #112]
+                fmul    z8.d, p4/m, z8.d, z14.d
+                fmul    z9.d, p4/m, z9.d, z14.d
+                fmul    z10.d, p4/m, z10.d, z14.d
+                fmul    z11.d, p4/m, z11.d, z14.d
+                fmla    z8.d, p4/m, z0.d, z15.d
+                fmla    z9.d, p4/m, z1.d, z15.d
+                fmla    z10.d, p4/m, z2.d, z15.d
+                fmla    z11.d, p4/m, z3.d, z15.d
+                str     q8, [x6, #64]
+                str     q9, [x6, #80]
+                str     q10, [x6, #96]
+                str     q11, [x6, #112]
+                add     x16, x16, #32
+                add     x7, x7, #32
+                add     x6, x6, x11
+                subs    w13, w13, #1
+                b.ne    43b
+                add     x16, x16, #768
+                add     x7, x7, #768
+                subs    w14, w14, #1
+                b.ne    42b
+                b       9f
+                // status 1: dst += beta * accum
+            50:
+                mov     w13, #8
+            53:
+                ldr     q0, [x16]
+                ldr     q1, [x16, #16]
+                ldr     q2, [x16, #256]
+                ldr     q3, [x16, #272]
+                ldr     q8, [x6, #0]
+                ldr     q9, [x6, #16]
+                ldr     q10, [x6, #32]
+                ldr     q11, [x6, #48]
+                fmla    z8.d, p4/m, z0.d, z15.d
+                fmla    z9.d, p4/m, z1.d, z15.d
+                fmla    z10.d, p4/m, z2.d, z15.d
+                fmla    z11.d, p4/m, z3.d, z15.d
+                str     q8, [x6, #0]
+                str     q9, [x6, #16]
+                str     q10, [x6, #32]
+                str     q11, [x6, #48]
+                ldr     q0, [x7]
+                ldr     q1, [x7, #16]
+                ldr     q2, [x7, #256]
+                ldr     q3, [x7, #272]
+                ldr     q8, [x6, #64]
+                ldr     q9, [x6, #80]
+                ldr     q10, [x6, #96]
+                ldr     q11, [x6, #112]
+                fmla    z8.d, p4/m, z0.d, z15.d
+                fmla    z9.d, p4/m, z1.d, z15.d
+                fmla    z10.d, p4/m, z2.d, z15.d
+                fmla    z11.d, p4/m, z3.d, z15.d
+                str     q8, [x6, #64]
+                str     q9, [x6, #80]
+                str     q10, [x6, #96]
+                str     q11, [x6, #112]
+                add     x16, x16, #32
+                add     x7, x7, #32
+                add     x6, x6, x11
+                subs    w13, w13, #1
+                b.ne    53b
+                add     x16, x16, #768
+                add     x7, x7, #768
+                subs    w14, w14, #1
+                b.ne    50b
+                b       9f
+                // status 0: dst = beta * accum (dst is not read)
+            60:
+                mov     w13, #8
+            63:
+                ldr     q0, [x16]
+                ldr     q1, [x16, #16]
+                ldr     q2, [x16, #256]
+                ldr     q3, [x16, #272]
+                fmul    z0.d, p4/m, z0.d, z15.d
+                fmul    z1.d, p4/m, z1.d, z15.d
+                fmul    z2.d, p4/m, z2.d, z15.d
+                fmul    z3.d, p4/m, z3.d, z15.d
+                str     q0, [x6, #0]
+                str     q1, [x6, #16]
+                str     q2, [x6, #32]
+                str     q3, [x6, #48]
+                ldr     q0, [x7]
+                ldr     q1, [x7, #16]
+                ldr     q2, [x7, #256]
+                ldr     q3, [x7, #272]
+                fmul    z0.d, p4/m, z0.d, z15.d
+                fmul    z1.d, p4/m, z1.d, z15.d
+                fmul    z2.d, p4/m, z2.d, z15.d
+                fmul    z3.d, p4/m, z3.d, z15.d
+                str     q0, [x6, #64]
+                str     q1, [x6, #80]
+                str     q2, [x6, #96]
+                str     q3, [x6, #112]
+                add     x16, x16, #32
+                add     x7, x7, #32
+                add     x6, x6, x11
+                subs    w13, w13, #1
+                b.ne    63b
+                add     x16, x16, #768
+                add     x7, x7, #768
+                subs    w14, w14, #1
+                b.ne    60b
             9:
                 smstop
                 ret
@@ -683,10 +892,22 @@ pub mod sme {
 
             let mut accum = [0.0 as T; MR * NR];
 
-            // The fused epilogue only handles a whole block whose rows are
-            // contiguous in `dst`; everything else falls back to the scalar loop
-            // below, which needs no per-element bounds handling.
-            let fused = (m == MR && n == NR && dst_rs == 1) as usize;
+            // A full block is written by the fused epilogue: `1` when the rows are
+            // contiguous in `dst` (column major, `dst_rs == 1`), `2` when the
+            // columns are (row major, `dst_cs == 1`). The trailing partial panels,
+            // and a `dst` that is contiguous along neither axis, keep the scalar
+            // loop below, which needs no per-element bounds handling.
+            let epilogue = if m == MR && n == NR {
+                if dst_rs == 1 {
+                    1
+                } else if dst_cs == 1 {
+                    2
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
 
             // The callee clobbers the volatile SIMD registers (`z0`-`z7` alias
             // `v0`-`v7`, which the caller uses for `alpha`/`beta`), so the call goes
@@ -705,9 +926,10 @@ pub mod sme {
                 in("x6") dst,
                 in("x7") (dst_cs * core::mem::size_of::<T>() as isize) as usize,
                 in("x8") alpha_status as usize,
-                in("x9") fused,
+                in("x9") epilogue as usize,
                 in("x10") alpha.to_bits(),
                 in("x11") beta.to_bits(),
+                in("x12") (dst_rs * core::mem::size_of::<T>() as isize) as usize,
                 out("z0") _,
                 out("z1") _,
                 out("z2") _,
@@ -716,14 +938,19 @@ pub mod sme {
                 out("z5") _,
                 out("z6") _,
                 out("z7") _,
+                out("z8") _,
+                out("z9") _,
+                out("z10") _,
+                out("z11") _,
                 out("z14") _,
                 out("z15") _,
                 out("p0") _,
                 out("p1") _,
+                out("p4") _,
                 clobber_abi("C"),
             );
 
-            if fused != 0 {
+            if epilogue != 0 {
                 return;
             }
 

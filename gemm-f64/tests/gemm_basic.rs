@@ -174,3 +174,41 @@ fn matches_reference_parallel() {
         }
     }
 }
+
+/// `kernel_params` splits `k` into chunks of `kc` (at most 512 before this
+/// change, larger for bigger `k`), so a `k` of 512, 1024 or 2048 runs the
+/// microkernel over one, two or four `k` chunks and the accumulator is
+/// accumulated across them (`beta == 1` for every chunk but the first). Both
+/// destination layouts have to survive that, in particular the row-major one
+/// where every chunk re-reads and re-writes the same 16x16 `dst` block with a
+/// `dst` row stride that is not a multiple of the block width.
+#[test]
+fn matches_reference_across_k_chunks() {
+    let coeffs = [(1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (2.3, 2.3)];
+    for k in [512usize, 1024, 2048] {
+        for (m, n) in [(16, 16), (32, 32), (17, 33), (48, 16)] {
+            for (alpha, beta) in coeffs {
+                for colmajor in [true, false] {
+                    check(m, n, k, alpha, beta, colmajor);
+                }
+            }
+        }
+    }
+}
+
+/// Same shapes through the threaded path, so the `k`-chunked accumulation is
+/// also covered when several jobs share the panels.
+#[cfg(feature = "rayon")]
+#[test]
+fn matches_reference_across_k_chunks_parallel() {
+    let coeffs = [(1.0, 1.0), (2.3, 2.3)];
+    for k in [512usize, 1024, 2048] {
+        for (m, n) in [(64, 64), (33, 49)] {
+            for (alpha, beta) in coeffs {
+                for colmajor in [true, false] {
+                    check_par(m, n, k, alpha, beta, colmajor, Parallelism::Rayon(3));
+                }
+            }
+        }
+    }
+}
