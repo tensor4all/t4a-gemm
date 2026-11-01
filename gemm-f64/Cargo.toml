@@ -30,5 +30,6 @@ std = ["dyn-stack/std", "gemm-common/std"]
 x86-v4 = ["gemm-common/x86-v4"]
 experimental-apple-amx = ["std", "gemm-common/experimental-apple-amx"]
 rayon = ["std", "gemm-common/rayon"]
-# Apple Scalable Matrix Extension microkernel (aarch64 + macOS >= 26 only)
-sme = []
+# Apple Scalable Matrix Extension microkernel (aarch64 + macOS >= 26 only);
+# the kernel needs `sysctl` for the runtime gate, so it implies `std`
+sme = ["std"]

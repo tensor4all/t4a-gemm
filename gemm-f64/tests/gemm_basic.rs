@@ -35,7 +35,11 @@ fn check(m: usize, n: usize, k: usize, alpha: f64, beta: f64, colmajor: bool) {
     let rhs: Vec<f64> = (0..k * n).map(|i| (i % 13) as f64 / 8.0 - 0.5).collect();
     let init: Vec<f64> = (0..m * n).map(|i| (i % 7) as f64 / 16.0).collect();
 
-    let (dst_cs, dst_rs) = if colmajor { (m as isize, 1) } else { (1, n as isize) };
+    let (dst_cs, dst_rs) = if colmajor {
+        (m as isize, 1)
+    } else {
+        (1, n as isize)
+    };
 
     let mut got = init.clone();
     let mut want = init.clone();

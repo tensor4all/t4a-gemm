@@ -1025,7 +1025,10 @@ macro_rules! gemm_def {
             #[cfg(target_arch = "aarch64")]
             {
                 if $crate::feature_detected!("neon") {
-                    #[cfg(feature = "sme")]
+                    // Apple only: `HasSme` and the kernel itself are
+                    // `target_vendor = "apple"` items, and other `aarch64` targets
+                    // have no SME kernel to dispatch to.
+                    #[cfg(all(feature = "sme", target_vendor = "apple"))]
                     if $crate::cache::HasSme::get() {
                         return sme::gemm_basic;
                     }
@@ -1087,7 +1090,7 @@ macro_rules! gemm_def {
 
         #[cfg(target_arch = "aarch64")]
         $crate::__inject_mod!(neon, $ty, 2 * $multiplier, Scalar, false);
-        #[cfg(all(target_arch = "aarch64", feature = "sme"))]
+        #[cfg(all(target_arch = "aarch64", target_vendor = "apple", feature = "sme"))]
         $crate::__inject_mod!(sme, $ty, 8 * $multiplier, Scalar, true);
         #[cfg(target_arch = "aarch64")]
         #[cfg(feature = "experimental-apple-amx")]
