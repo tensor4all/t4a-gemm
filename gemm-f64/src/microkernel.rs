@@ -453,23 +453,31 @@ pub mod amx {
 /// not supported.
 ///
 /// `fmopa za_t.d, p0/m, p1/m, z0.d, z_m.d` computes
-/// `ZA_t[i][j] += z0[i] * z_m[j]`, i.e. with `z0 = A[..][kk]` and `z_m = B[kk][8t..]`
-/// it accumulates `ZA_t[i][j] += A[i][kk] * B[kk][8t + j]`, which is a transposed
+/// `ZA_t[i][j] += z0[i] * z_m[j]`, i.e. with `z0 = A[..][kk]` and `z_m = B[kk][8c..]`
+/// it accumulates `ZA_t[i][j] += A[i][kk] * B[kk][8c + j]`, which is a transposed
 /// outer product: `ZA_t = A_panel^T @ B_panel`. Since `ZA` holds `svl/64 x svl/64`
 /// elements and `svl == 64` bytes here, one tile is exactly an `8 x 8` block of
-/// `dst`, with `i` running over `MR = 8` rows and `j` over 8 of the `NR = 32`
-/// columns.
+/// `dst`. The four `za64` tiles are laid out as a `2 x 2` grid of tiles, so one
+/// invocation computes an `MR = 16` by `NR = 16` block: `za0`/`za1` hold rows
+/// `0..8` (columns `0..8` and `8..16`), `za2`/`za3` rows `8..16`.
+///
+/// `MR = 16` (not 8) is deliberate: one column of the accumulator block is then
+/// `16 * 8 = 128` bytes, i.e. exactly one cache line, and the two 64 byte `st1d`
+/// halves of it are adjacent. With `MR = 8` every `st1d` writes only the low half
+/// of a line.
 ///
 /// Layout produced by `pack_operands` matches the instructions exactly:
-/// `MR = 8` contiguous `f64` per `k` step for the lhs (= one `Z` register) and
-/// `NR = 32` contiguous `f64` per `k` step for the rhs (= four `Z` registers), so
-/// the inner loop is four loads and four outer products per `k`.
+/// `MR = 16` contiguous `f64` per `k` step for the lhs (= two `Z` registers) and
+/// `NR = 16` contiguous `f64` per `k` step for the rhs (= two `Z` registers), so
+/// the inner loop is four loads and four outer products per `k`, and per `k` it
+/// loads `16 + 16 = 32` `f64` for `16 x 16` multiply-adds instead of the
+/// `8 + 32 = 40` `f64` an `8 x 32` block needs.
 ///
-/// The instruction words are emitted with `.inst` because
-/// `#[target_feature(enable = "sme")]` and the SME intrinsics are still unstable
-/// (rust-lang/rust#150244); every word is annotated with the instruction it encodes.
-/// `ZA` and streaming mode are enabled per call with `smstart`/`smstop`, which is
-/// what makes this safe to use from arbitrary threads: macOS saves the `ZA` and
+/// The instruction mnemonics are only accepted because of the `.arch` line: the
+/// SME intrinsics and `#[target_feature(enable = "sme")]` are still unstable
+/// (rust-lang/rust#150244), so the kernel is written as assembly. `ZA` and
+/// streaming mode are enabled per call with `smstart`/`smstop`, which is what
+/// makes this safe to use from arbitrary threads: macOS saves the `ZA` and
 /// streaming mode state on context switch (verified on macOS 26 / M5 Max).
 #[cfg(all(
     target_arch = "aarch64",
@@ -483,10 +491,10 @@ pub mod sme {
 
         /// `f64` lanes per `Z` register (as wide as one `ZA64` tile row).
         pub const N: usize = 8;
-        /// `Z` register writes per microkernel row panel: `MR = MR_DIV_N * N = 8`.
-        pub const MR_DIV_N: usize = 1;
+        /// `Z` register writes per microkernel row panel: `MR = MR_DIV_N * N = 16`.
+        pub const MR_DIV_N: usize = 2;
         /// Columns per microkernel invocation: four `ZA64` tiles.
-        pub const NR: usize = 32;
+        pub const NR: usize = 16;
 
         const MR: usize = MR_DIV_N * N;
 
@@ -503,68 +511,53 @@ pub mod sme {
         //
         // Defined in assembly (outside the inline-asm constraints) because the body
         // relies on ZA, on the streaming mode state `smstart` just enabled, on
-        // all-active predicate registers and on registers `x0`-`x7`/`x12` only; a
+        // all-active predicate registers and on registers `x0`-`x12` only; a
         // real function keeps that out of the compiler's register allocation.
         core::arch::global_asm!(
             r#"
+            .arch   armv9-a+sme+sme-f64f64
             .globl  _t4a_gemm_f64_sme_ukr
             .p2align 4
             _t4a_gemm_f64_sme_ukr:
                 // x0 = k, x1 = lhs, x2 = rhs, x3 = lhs_step, x4 = rhs_step, x5 = accum
-                .inst 0xd503477f            // smstart
-                .inst 0xc00800ff            // zero {{za}}
-                .inst 0x25d8e3e0            // ptrue p0.d
-                .inst 0x25d8e3e1            // ptrue p1.d
+                smstart
+                zero    {{za}}
+                ptrue   p0.d
+                ptrue   p1.d
             1:
-                .inst 0x85804020            // ldr z0, [x1]
-                .inst 0x85804041            // ldr z1, [x2]
-                .inst 0x85804442            // ldr z2, [x2, #1, mul vl]
-                .inst 0x85804843            // ldr z3, [x2, #2, mul vl]
-                .inst 0x85804c44            // ldr z4, [x2, #3, mul vl]
-                .inst 0x80c12000            // fmopa za0.d, p0/m, p1/m, z0.d, z1.d
-                .inst 0x80c22001            // fmopa za1.d, p0/m, p1/m, z0.d, z2.d
-                .inst 0x80c32002            // fmopa za2.d, p0/m, p1/m, z0.d, z3.d
-                .inst 0x80c42003            // fmopa za3.d, p0/m, p1/m, z0.d, z4.d
+                ldr     z0, [x1]                // A rows 0..8
+                ldr     z1, [x1, #1, mul vl]    // A rows 8..16
+                ldr     z2, [x2]                // B cols 0..8
+                ldr     z3, [x2, #1, mul vl]    // B cols 8..16
+                fmopa   za0.d, p0/m, p1/m, z0.d, z2.d
+                fmopa   za1.d, p0/m, p1/m, z0.d, z3.d
+                fmopa   za2.d, p0/m, p1/m, z1.d, z2.d
+                fmopa   za3.d, p0/m, p1/m, z1.d, z3.d
                 add     x1, x1, x3
                 add     x2, x2, x4
                 subs    x0, x0, #1
                 b.ne    1b
-                // spill one column (= MR f64) at a time; x5 walks the tile,
-                // x6 is the column stride, x7 counts the 8 columns, w12 is the slice
-                mov     x6, #64
+                // spill one column (= MR = 16 f64 = 128 B = one cache line) at a
+                // time: za0/za2 fill the two 64 B halves of that line, za1/za3 the
+                // line 1024 B further (columns 8..16 of the block)
+                add     x6, x5, #64
+                add     x7, x5, #1024
+                add     x8, x7, #64
                 mov     w12, #0
-                mov     x7, #8
+                mov     w10, #8
             2:
-                .inst 0xe0ff80a0            // st1d {{za0v.d[w12, 0]}}, p0, [x5]
-                add     x5, x5, x6
+                st1d    {{za0v.d[w12, 0]}}, p0, [x5]
+                st1d    {{za2v.d[w12, 0]}}, p0, [x6]
+                st1d    {{za1v.d[w12, 0]}}, p0, [x7]
+                st1d    {{za3v.d[w12, 0]}}, p0, [x8]
+                add     x5, x5, #128
+                add     x6, x6, #128
+                add     x7, x7, #128
+                add     x8, x8, #128
                 add     w12, w12, #1
-                subs    x7, x7, #1
+                subs    w10, w10, #1
                 b.ne    2b
-                mov     w12, #0
-                mov     x7, #8
-            3:
-                .inst 0xe0ff80a2            // st1d {{za1v.d[w12, 0]}}, p0, [x5]
-                add     x5, x5, x6
-                add     w12, w12, #1
-                subs    x7, x7, #1
-                b.ne    3b
-                mov     w12, #0
-                mov     x7, #8
-            4:
-                .inst 0xe0ff80a4            // st1d {{za2v.d[w12, 0]}}, p0, [x5]
-                add     x5, x5, x6
-                add     w12, w12, #1
-                subs    x7, x7, #1
-                b.ne    4b
-                mov     w12, #0
-                mov     x7, #8
-            5:
-                .inst 0xe0ff80a6            // st1d {{za3v.d[w12, 0]}}, p0, [x5]
-                add     x5, x5, x6
-                add     w12, w12, #1
-                subs    x7, x7, #1
-                b.ne    5b
-                .inst 0xd503467f            // smstop
+                smstop
                 ret
             "#
         );
@@ -628,7 +621,6 @@ pub mod sme {
                 out("z1") _,
                 out("z2") _,
                 out("z3") _,
-                out("z4") _,
                 out("p0") _,
                 out("p1") _,
                 clobber_abi("C"),
@@ -662,6 +654,7 @@ pub mod sme {
                 }
             }
         }
+
     }
 }
 
