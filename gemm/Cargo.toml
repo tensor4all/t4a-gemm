@@ -3,7 +3,7 @@ name = "t4a-gemm"
 version = "0.19.0"
 edition = "2021"
 authors = ["sarah <>"]
-description = "Playground for matrix multiplication algorithms"
+description = "Playground for matrix multiplication algorithms -- tensor4all fork: adds an Apple Silicon SME (aarch64 + macOS 26) path, everything else is upstream code"
 readme = "../README.md"
 repository = "https://github.com/tensor4all/t4a-gemm"
 homepage = "https://github.com/tensor4all/t4a-gemm"
@@ -31,7 +31,7 @@ gemm-c64 = { package = "t4a-gemm-c64", version = "0.19.0", path = "../gemm-c64",
 gemm-f16 = { package = "t4a-gemm-f16", version = "0.19.0", path = "../gemm-f16", default-features = false, optional = true }
 
 [features]
-default = ["std", "rayon", "f16", "sme"]
+default = ["std", "rayon", "f16", "apple-sme"]
 f16 = ["gemm-f16", "gemm-common/f16"]
 std = [
   "dyn-stack/std",
@@ -42,7 +42,13 @@ std = [
   "gemm-c64/std",
   "gemm-f16?/std",
 ]
-sme = ["gemm-f64/sme", "gemm-f32/sme", "gemm-c32/sme", "gemm-c64/sme"]
+apple-sme = [
+  "gemm-common/apple-sme",
+  "gemm-f64/apple-sme",
+  "gemm-f32/apple-sme",
+  "gemm-c32/apple-sme",
+  "gemm-c64/apple-sme",
+]
 x86-v4 = [
   "gemm-common/x86-v4",
   "gemm-f32/x86-v4",

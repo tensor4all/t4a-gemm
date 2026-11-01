@@ -3,7 +3,7 @@ name = "t4a-gemm-f16"
 version = "0.19.0"
 edition = "2021"
 authors = ["sarah <>"]
-description = "Playground for matrix multiplication algorithms"
+description = "Playground for matrix multiplication algorithms -- tensor4all fork: adds an Apple Silicon SME (aarch64 + macOS 26) path, everything else is upstream code"
 readme = "../README.md"
 repository = "https://github.com/tensor4all/t4a-gemm"
 homepage = "https://github.com/tensor4all/t4a-gemm"
@@ -35,4 +35,4 @@ x86-v4 = ["gemm-common/x86-v4", "gemm-f32/x86-v4"]
 rayon = ["dep:rayon", "std", "gemm-common/rayon", "gemm-f32/rayon"]
 # gemm-f16 has no SME microkernel (that would need FEAT_SME_F16F16 and a
 # different packed layout); declared so the workspace feature set stays uniform
-sme = []
+apple-sme = []

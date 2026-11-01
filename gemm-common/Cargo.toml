@@ -3,7 +3,7 @@ name = "t4a-gemm-common"
 version = "0.19.0"
 edition = "2021"
 authors = ["sarah <>"]
-description = "Playground for matrix multiplication algorithms"
+description = "Playground for matrix multiplication algorithms -- tensor4all fork: adds an Apple Silicon SME (aarch64 + macOS 26) path, everything else is upstream code"
 readme = "../README.md"
 repository = "https://github.com/tensor4all/t4a-gemm"
 homepage = "https://github.com/tensor4all/t4a-gemm"
@@ -43,3 +43,6 @@ wasm-simd128-enable = []
 experimental-apple-amx = ["std"]
 rayon = ["dep:rayon", "std"]
 f16 = ["half"]
+# Enables `cache::HasAppleSme`, the runtime probe for the Apple SME kernels.
+# Only meaningful on aarch64 + target_vendor = "apple"; the dtype crates forward it.
+apple-sme = ["std"]

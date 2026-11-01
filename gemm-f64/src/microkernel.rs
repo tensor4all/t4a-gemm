@@ -446,6 +446,12 @@ pub mod amx {
 
 /// Apple `SME` microkernel for `f64`.
 ///
+/// Apple Silicon only: this module exists only under
+/// `all(target_vendor = "apple", target_arch = "aarch64", feature = "apple-sme")`.
+/// SME itself is an Armv9 feature, but only Apple's implementation (`svl == 64`,
+/// macOS 26 or newer) has been validated here, so generic aarch64 (Linux) SME is
+/// not supported.
+///
 /// `fmopa za_t.d, p0/m, p1/m, z0.d, z_m.d` computes
 /// `ZA_t[i][j] += z0[i] * z_m[j]`, i.e. with `z0 = A[..][kk]` and `z_m = B[kk][8t..]`
 /// it accumulates `ZA_t[i][j] += A[i][kk] * B[kk][8t + j]`, which is a transposed
@@ -469,7 +475,7 @@ pub mod amx {
     target_arch = "aarch64",
     target_vendor = "apple",
     feature = "std",
-    feature = "sme"
+    feature = "apple-sme"
 ))]
 pub mod sme {
     pub mod f64 {

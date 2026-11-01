@@ -563,6 +563,12 @@ pub mod simd128 {
 
 /// Apple SME (`FEAT_SME` + `FEAT_SME_F32F32`) microkernel for `f32`.
 ///
+/// Apple Silicon only: this module exists only under
+/// `all(target_vendor = "apple", target_arch = "aarch64", feature = "apple-sme")`.
+/// SME itself is an Armv9 feature, but only Apple's implementation (`svl == 64`,
+/// macOS 26 or newer) has been validated here, so generic aarch64 (Linux) SME is
+/// not supported.
+///
 /// Same shape as the `f64` one in `gemm-f64`: `MR = 16`, `NR = 64` (four `ZA32`
 /// tiles), one `Z` register holds the 16 `f32` of a `ZA32` tile row, and the
 /// kernel is a `global_asm!` function because `#[target_feature(enable = "sme")]`
@@ -580,7 +586,7 @@ pub mod simd128 {
     target_arch = "aarch64",
     target_vendor = "apple",
     feature = "std",
-    feature = "sme"
+    feature = "apple-sme"
 ))]
 pub mod sme {
     pub mod f32 {

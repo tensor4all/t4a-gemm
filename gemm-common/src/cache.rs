@@ -49,24 +49,14 @@ impl DivCeil for usize {
     }
 }
 
-/// Runtime check for Apple's Scalable Matrix Extension.
-///
-/// Every SME microkernel needs
-///  - `FEAT_SME`,
-///  - `svl == 64` bytes, so that one `ZA64` tile is exactly 8x8 `f64` and one `Z`
-///    register holds 8 `f64` (`ZA32`: 16x16 `f32`, 16 `f32` per `Z` register),
-///  - an OS that saves/restores `ZA` and the streaming mode state on context
-///    switches. macOS only started doing that in release 26; older releases trap
-///    on `SMSTART` even on hardware that reports `FEAT_SME`, and a `SIGILL` cannot
-///    be recovered from, so the OS version is part of the check.
-///
-/// On top of that the element type decides which outer product is needed:
-///  - `f64` and `c64` use `fmopa za64.d`, which needs `FEAT_SME_F64F64`,
-///  - `f32` and `c32` use `fmopa za32.s`, which needs `FEAT_SME_F32F32`.
-///
-/// `f64f64`: probe `FEAT_SME_F64F64` instead of `FEAT_SME_F32F32`.
-#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-fn has_sme_impl(f64f64: bool) -> bool {
+/// Probe `FEAT_SME_F64F64` (`f64f64 = true`) or `FEAT_SME_F32F32` (false), and
+/// also require `FEAT_SME`, `svl == 64` and macOS >= 26; see [`HasAppleSme`].
+#[cfg(all(
+    target_arch = "aarch64",
+    target_vendor = "apple",
+    feature = "apple-sme"
+))]
+fn has_apple_sme_impl(f64f64: bool) -> bool {
     if !cfg!(miri) {
         #[cfg(feature = "std")]
         {
@@ -123,43 +113,85 @@ fn has_sme_impl(f64f64: bool) -> bool {
     false
 }
 
-#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-pub struct HasSme;
+/// Runtime check for the Apple Silicon implementation of the Scalable Matrix
+/// Extension (SME).
+///
+/// SME is an Armv9 feature, not an Apple one, but this implementation is enabled
+/// *only* on
+///  - `target_vendor = "apple"` + `target_arch = "aarch64"` — the `apple-sme`
+///    feature is gated on both in every crate of this workspace, so this struct
+///    does not exist anywhere else,
+///  - macOS 26 or newer,
+///  - `FEAT_SME` plus the outer product the element type needs: `FEAT_SME_F64F64`
+///    for `f64`/`c64` (`fmopa za64.d`) and `FEAT_SME_F32F32` for `f32`/`c32`
+///    (`fmopa za32.s`),
+///  - `svl == 64` bytes. The `global_asm!` bodies are written for a 512 bit
+///    streaming vector length, so one `ZA64` tile is exactly 8x8 `f64` and one
+///    `Z` register holds 8 `f64` (`ZA32`: 16x16 `f32`, 16 `f32` per register).
+///
+/// The OS version is part of the check because saving and restoring `ZA` and the
+/// streaming mode state across a context switch is an OS responsibility: macOS
+/// only started doing that in release 26. Older releases trap on `SMSTART` even
+/// on hardware that reports `FEAT_SME`, and a `SIGILL` cannot be recovered from.
+///
+/// Linux SME kernels and any future non-Apple implementation are *deliberately*
+/// excluded. They have not been validated here at all, and because the `ZA`
+/// context-switch behaviour is OS specific — only measured on Apple, macOS 26 /
+/// M5 Max — enabling them on the strength of the feature bits alone could
+/// silently corrupt accumulators.
+#[cfg(all(
+    target_arch = "aarch64",
+    target_vendor = "apple",
+    feature = "apple-sme"
+))]
+pub struct HasAppleSme;
 
-#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-impl HasSme {
+#[cfg(all(
+    target_arch = "aarch64",
+    target_vendor = "apple",
+    feature = "apple-sme"
+))]
+impl HasAppleSme {
     /// The `f64`/`c64` kernels: `FEAT_SME` + `FEAT_SME_F64F64`.
     #[inline]
     pub fn get() -> bool {
-        cached_sme(0)
+        cached_apple_sme(0)
     }
 
     /// The `f32`/`c32` kernels: `FEAT_SME` + `FEAT_SME_F32F32`.
     #[inline]
     pub fn get_f32() -> bool {
-        cached_sme(1)
+        cached_apple_sme(1)
     }
 }
 
 /// `f64`, then `f32`: the two probes are cached separately.
-#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
-static HAS_SME: [core::sync::atomic::AtomicU8; 2] = [
+#[cfg(all(
+    target_arch = "aarch64",
+    target_vendor = "apple",
+    feature = "apple-sme"
+))]
+static HAS_APPLE_SME: [core::sync::atomic::AtomicU8; 2] = [
     core::sync::atomic::AtomicU8::new(u8::MAX),
     core::sync::atomic::AtomicU8::new(u8::MAX),
 ];
 
-#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+#[cfg(all(
+    target_arch = "aarch64",
+    target_vendor = "apple",
+    feature = "apple-sme"
+))]
 #[inline]
-fn cached_sme(idx: usize) -> bool {
+fn cached_apple_sme(idx: usize) -> bool {
     use ::core::sync::atomic::Ordering;
 
-    let mut has_sme = HAS_SME[idx].load(Ordering::Relaxed);
-    if has_sme == u8::MAX {
-        let b = has_sme_impl(idx == 0) as u8;
-        HAS_SME[idx].store(b, Ordering::Relaxed);
-        has_sme = b;
+    let mut has_apple_sme = HAS_APPLE_SME[idx].load(Ordering::Relaxed);
+    if has_apple_sme == u8::MAX {
+        let b = has_apple_sme_impl(idx == 0) as u8;
+        HAS_APPLE_SME[idx].store(b, Ordering::Relaxed);
+        has_apple_sme = b;
     }
-    has_sme != 0
+    has_apple_sme != 0
 }
 
 #[cfg(target_vendor = "apple")]

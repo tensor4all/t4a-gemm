@@ -677,6 +677,12 @@ pub mod neonfcma {
 
 /// Apple SME (`FEAT_SME` + `FEAT_SME_F32F32`) microkernel for `c32`.
 ///
+/// Apple Silicon only: this module exists only under
+/// `all(target_vendor = "apple", target_arch = "aarch64", feature = "apple-sme")`.
+/// SME itself is an Armv9 feature, but only Apple's implementation (`svl == 64`,
+/// macOS 26 or newer) has been validated here, so generic aarch64 (Linux) SME is
+/// not supported.
+///
 /// Same structure as the `c64` one in `gemm-c64`: SME has no complex outer
 /// product, so a complex block is built from four real `FMOPA za32.s` per column
 /// block, with the real and imaginary parts in separate `ZA32` tiles and the
@@ -690,7 +696,7 @@ pub mod neonfcma {
     target_arch = "aarch64",
     target_vendor = "apple",
     feature = "std",
-    feature = "sme"
+    feature = "apple-sme"
 ))]
 pub mod sme {
     pub mod c32 {

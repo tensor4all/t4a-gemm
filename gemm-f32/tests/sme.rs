@@ -113,9 +113,13 @@ fn matches_reference() {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_vendor = "apple", feature = "sme"))]
+#[cfg(all(
+    target_arch = "aarch64",
+    target_vendor = "apple",
+    feature = "apple-sme"
+))]
 mod ukr {
-    use gemm_common::cache::HasSme;
+    use gemm_common::cache::HasAppleSme;
     use gemm_f32::microkernel::sme::f32::*;
 
     const MR: usize = MR_DIV_N * N;
@@ -177,7 +181,7 @@ mod ukr {
 
     #[test]
     fn ukernel_block() {
-        if !HasSme::get_f32() {
+        if !HasAppleSme::get_f32() {
             eprintln!("skipping: no FEAT_SME_F32F32 on this machine");
             return;
         }

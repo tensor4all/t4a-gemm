@@ -984,7 +984,7 @@ macro_rules! __inject_mod_cplx {
 
 #[macro_export]
 macro_rules! gemm_def {
-    // `$sme_gate` names the `HasSme` probe that guards the SME microkernels: `get`
+    // `$sme_gate` names the `HasAppleSme` probe that guards the SME microkernels: `get`
     // for the `f64` (`FMOPA za64.d`) kernel, `get_f32` for the `f32` (`FMOPA
     // za32.s`) one.
     ($ty: tt, $multiplier: expr, $sme_gate: ident) => {
@@ -1028,11 +1028,15 @@ macro_rules! gemm_def {
             #[cfg(target_arch = "aarch64")]
             {
                 if $crate::feature_detected!("neon") {
-                    // Apple only: `HasSme` and the kernel itself are
+                    // Apple Silicon only: `HasAppleSme` and the kernel itself are
                     // `target_vendor = "apple"` items, and other `aarch64` targets
                     // have no SME kernel to dispatch to.
-                    #[cfg(all(feature = "sme", target_vendor = "apple"))]
-                    if $crate::cache::HasSme::$sme_gate() {
+                    #[cfg(all(
+                        target_arch = "aarch64",
+                        target_vendor = "apple",
+                        feature = "apple-sme"
+                    ))]
+                    if $crate::cache::HasAppleSme::$sme_gate() {
                         return sme::gemm_basic;
                     }
                     #[cfg(feature = "experimental-apple-amx")]
@@ -1093,7 +1097,11 @@ macro_rules! gemm_def {
 
         #[cfg(target_arch = "aarch64")]
         $crate::__inject_mod!(neon, $ty, 2 * $multiplier, Scalar, false);
-        #[cfg(all(target_arch = "aarch64", target_vendor = "apple", feature = "sme"))]
+        #[cfg(all(
+            target_arch = "aarch64",
+            target_vendor = "apple",
+            feature = "apple-sme"
+        ))]
         $crate::__inject_mod!(sme, $ty, 8 * $multiplier, Scalar, true);
         #[cfg(target_arch = "aarch64")]
         #[cfg(feature = "experimental-apple-amx")]
@@ -1106,7 +1114,7 @@ macro_rules! gemm_def {
 
 #[macro_export]
 macro_rules! gemm_cplx_def {
-    // `$sme_gate` is the same per-element-type `HasSme` probe as in `gemm_def!`.
+    // `$sme_gate` is the same per-element-type `HasAppleSme` probe as in `gemm_def!`.
     ($ty: tt, $cplx_ty: tt, $multiplier: expr, $sme_gate: ident) => {
         type GemmCplxTy = unsafe fn(
             usize,
@@ -1144,9 +1152,13 @@ macro_rules! gemm_cplx_def {
 
             #[cfg(target_arch = "aarch64")]
             {
-                // Apple only, like the `f64`/`f32` kernels above.
-                #[cfg(all(feature = "sme", target_vendor = "apple"))]
-                if $crate::cache::HasSme::$sme_gate() {
+                // Apple Silicon only, like the `f64`/`f32` kernels above.
+                #[cfg(all(
+                    target_arch = "aarch64",
+                    target_vendor = "apple",
+                    feature = "apple-sme"
+                ))]
+                if $crate::cache::HasAppleSme::$sme_gate() {
                     return sme::gemm_basic;
                 }
                 if $crate::feature_detected!("neon") && $crate::feature_detected!("fcma") {
@@ -1181,7 +1193,11 @@ macro_rules! gemm_cplx_def {
         #[cfg(target_arch = "aarch64")]
         $crate::__inject_mod!(neonfcma, $cplx_ty, 1 * $multiplier, Scalar, false);
         // A `Z` register holds `4 * $multiplier` complex elements (64 bytes).
-        #[cfg(all(target_arch = "aarch64", target_vendor = "apple", feature = "sme"))]
+        #[cfg(all(
+            target_arch = "aarch64",
+            target_vendor = "apple",
+            feature = "apple-sme"
+        ))]
         $crate::__inject_mod!(sme, $cplx_ty, 4 * $multiplier, Scalar, true);
 
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]

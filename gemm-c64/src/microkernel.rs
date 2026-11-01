@@ -640,6 +640,12 @@ pub mod neonfcma {
 
 /// Apple SME (`FEAT_SME` + `FEAT_SME_F64F64`) microkernel for `c64`.
 ///
+/// Apple Silicon only: this module exists only under
+/// `all(target_vendor = "apple", target_arch = "aarch64", feature = "apple-sme")`.
+/// SME itself is an Armv9 feature, but only Apple's implementation (`svl == 64`,
+/// macOS 26 or newer) has been validated here, so generic aarch64 (Linux) SME is
+/// not supported.
+///
 /// SME has no complex outer product: `FMOPA` takes two vectors of reals, and
 /// there is no `za`-form `FCMLA` (the assembler rejects `fcmla za0.d, ...` and
 /// there is no complex `*MOPA` mnemonic at all, in `FEAT_SME` or `FEAT_SME2`).
@@ -665,7 +671,7 @@ pub mod neonfcma {
     target_arch = "aarch64",
     target_vendor = "apple",
     feature = "std",
-    feature = "sme"
+    feature = "apple-sme"
 ))]
 pub mod sme {
     pub mod c64 {
