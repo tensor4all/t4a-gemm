@@ -1025,6 +1025,10 @@ macro_rules! gemm_def {
             #[cfg(target_arch = "aarch64")]
             {
                 if $crate::feature_detected!("neon") {
+                    #[cfg(feature = "sme")]
+                    if $crate::cache::HasSme::get() {
+                        return sme::gemm_basic;
+                    }
                     #[cfg(feature = "experimental-apple-amx")]
                     if $crate::cache::HasAmx::get() {
                         return amx::gemm_basic;
@@ -1083,6 +1087,8 @@ macro_rules! gemm_def {
 
         #[cfg(target_arch = "aarch64")]
         $crate::__inject_mod!(neon, $ty, 2 * $multiplier, Scalar, false);
+        #[cfg(all(target_arch = "aarch64", feature = "sme"))]
+        $crate::__inject_mod!(sme, $ty, 8 * $multiplier, Scalar, true);
         #[cfg(target_arch = "aarch64")]
         #[cfg(feature = "experimental-apple-amx")]
         $crate::__inject_mod!(amx, $ty, 8 * $multiplier, Scalar, true);

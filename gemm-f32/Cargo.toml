@@ -30,3 +30,6 @@ std = ["dyn-stack/std", "gemm-common/std"]
 x86-v4 = ["gemm-common/x86-v4"]
 experimental-apple-amx = ["std", "gemm-common/experimental-apple-amx"]
 rayon = ["std", "gemm-common/rayon"]
+# only gemm-f64 ships an SME microkernel; declared so the shared `gemm_def!`
+# expansion has a known cfg on every crate
+sme = []

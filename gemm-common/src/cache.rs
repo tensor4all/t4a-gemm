@@ -49,6 +49,76 @@ impl DivCeil for usize {
     }
 }
 
+/// Runtime check for Apple's Scalable Matrix Extension.
+///
+/// The `f64` microkernel in `gemm-f64` needs
+///  - `FEAT_SME` and `FEAT_SME_F64F64` (the `fmopa za64` outer product), and
+///  - `svl == 64` bytes, so that one `ZA64` tile is exactly 8x8 `f64` and one `Z`
+///    register holds 8 `f64`,
+///  - an OS that saves/restores `ZA` and the streaming mode state on context
+///    switches. macOS only started doing that in release 26; older releases trap
+///    on `SMSTART` even on hardware that reports `FEAT_SME`, and a `SIGILL` cannot
+///    be recovered from, so the OS version is part of the check.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+fn has_sme_impl() -> bool {
+    if !cfg!(miri) {
+        #[cfg(feature = "std")]
+        {
+            use sysctl::Ctl;
+            use sysctl::Sysctl;
+
+            let flag = |name: &str| -> bool {
+                Ctl::new(name)
+                    .and_then(|ctl| ctl.value_string())
+                    .map(|value| value.trim() == "1")
+                    .unwrap_or(false)
+            };
+            if !flag("hw.optional.arm.FEAT_SME") || !flag("hw.optional.arm.FEAT_SME_F64F64") {
+                return false;
+            }
+
+            let svl = Ctl::new("hw.optional.arm.sme_max_svl_b")
+                .and_then(|ctl| ctl.value_string())
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok());
+            if svl != Some(64) {
+                return false;
+            }
+
+            let os_major = Ctl::new("kern.osproductversion")
+                .and_then(|ctl| ctl.value_string())
+                .ok()
+                .and_then(|value| {
+                    value
+                        .trim()
+                        .split('.')
+                        .next()
+                        .and_then(|major| major.parse::<u32>().ok())
+                });
+            return os_major.map(|major| major >= 26).unwrap_or(false);
+        }
+    }
+    false
+}
+
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+pub struct HasSme;
+
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+impl HasSme {
+    #[inline]
+    pub fn get() -> bool {
+        static HAS_SME: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(u8::MAX);
+        let mut has_sme = HAS_SME.load(::core::sync::atomic::Ordering::Relaxed);
+        if has_sme == u8::MAX {
+            let b = has_sme_impl() as u8;
+            HAS_SME.store(b, ::core::sync::atomic::Ordering::Relaxed);
+            has_sme = b;
+        }
+        has_sme != 0
+    }
+}
+
 #[cfg(target_vendor = "apple")]
 fn has_amx_impl() -> bool {
     if !cfg!(miri) {
