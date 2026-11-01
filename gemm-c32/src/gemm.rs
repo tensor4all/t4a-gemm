@@ -3,5 +3,5 @@ pub mod f32 {
     use gemm_common::gemm::c32;
 
     type T = f32;
-    gemm_common::gemm_cplx_def!(f32, c32, 2, get_f32);
+    gemm_common::gemm_cplx_def!(f32, c32, 2, get_f32, gemm_common::sme_thresholds::C32);
 }
