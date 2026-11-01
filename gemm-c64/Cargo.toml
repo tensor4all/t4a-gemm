@@ -3,7 +3,7 @@ name = "t4a-gemm-c64"
 version = "0.19.0"
 edition = "2021"
 authors = ["sarah <>"]
-description = "Playground for matrix multiplication algorithms"
+description = "Playground for matrix multiplication algorithms -- tensor4all fork: adds an Apple Silicon SME (aarch64 + macOS 26) path, everything else is upstream code"
 readme = "../README.md"
 repository = "https://github.com/tensor4all/t4a-gemm"
 homepage = "https://github.com/tensor4all/t4a-gemm"
@@ -25,11 +25,11 @@ paste = { workspace = true }
 gemm-common = { package = "t4a-gemm-common", version = "0.19.0", default-features = false, path = "../gemm-common" }
 
 [features]
-default = ["std", "rayon"]
+default = ["std", "rayon", "apple-sme"]
 std = ["dyn-stack/std", "gemm-common/std"]
 experimental-apple-amx = ["std", "gemm-common/experimental-apple-amx"]
 x86-v4 = ["gemm-common/x86-v4"]
 rayon = ["std", "gemm-common/rayon"]
-# only gemm-f64 ships an SME microkernel; declared so the shared `gemm_def!`
-# expansion has a known cfg on every crate
-sme = []
+# Apple Scalable Matrix Extension microkernel (aarch64 + macOS >= 26 only);
+# one feature for every dtype, the runtime gate differs per element type
+apple-sme = ["std", "gemm-common/apple-sme"]

@@ -637,3 +637,252 @@ pub mod neonfcma {
         pub const H_UKR: [[gemm_common::microkernel::HMicroKernelFn<T>; H_N]; H_M] = [];
     }
 }
+
+/// Apple SME (`FEAT_SME` + `FEAT_SME_F64F64`) microkernel for `c64`.
+///
+/// Apple Silicon only: this module exists only under
+/// `all(target_vendor = "apple", target_arch = "aarch64", feature = "apple-sme")`.
+/// SME itself is an Armv9 feature, but only Apple's implementation (`svl == 64`,
+/// macOS 26 or newer) has been validated here, so generic aarch64 (Linux) SME is
+/// not supported.
+///
+/// SME has no complex outer product: `FMOPA` takes two vectors of reals, and
+/// there is no `za`-form `FCMLA` (the assembler rejects `fcmla za0.d, ...` and
+/// there is no complex `*MOPA` mnemonic at all, in `FEAT_SME` or `FEAT_SME2`).
+/// A complex block is therefore computed with four real outer products per
+/// column block, exactly as Arm's own SME complex GEMM example does it:
+///
+/// ```text
+/// Re += Lr * Rr        Im += Lr * Ri
+/// Re += Li * (-Ri)     Im += Li * Rr
+/// ```
+///
+/// Each output column block keeps two `ZA64` tiles, one for the real part and one
+/// for the imaginary part, so four tiles hold `MR = 8` complex rows by
+/// `NR = 16` complex columns. `Lr`/`Li`/`Rr`/`Ri` are obtained from the
+/// interleaved (`re, im`) packed operands with `UZP1`/`UZP2` on 64-bit elements:
+/// one `Z` register holds four complex, so two loads plus two unzips give the
+/// eight reals and eight imaginaries a `ZA64` tile needs.
+///
+/// Conjugation is a sign flip of an imaginary part, applied with a predicated
+/// `FNEG`: the predicate is all-true or all-false, so no branch is needed in the
+/// `k` loop.
+#[cfg(all(
+    target_arch = "aarch64",
+    target_vendor = "apple",
+    feature = "std",
+    feature = "apple-sme"
+))]
+pub mod sme {
+    pub mod c64 {
+        pub type T = num_complex::Complex64;
+
+        /// Complex elements per `Z` register (four `c64` = 64 bytes).
+        pub const N: usize = 4;
+        /// `Z` register reads per microkernel row panel: `MR = MR_DIV_N * N = 8`.
+        pub const MR_DIV_N: usize = 2;
+        /// Complex columns per microkernel invocation: four `ZA64` tiles, two for
+        /// the real part and two for the imaginary part.
+        pub const NR: usize = 16;
+
+        const MR: usize = MR_DIV_N * N;
+
+        pub const UKR: [[gemm_common::microkernel::MicroKernelFn<T>; NR]; MR_DIV_N] =
+            [[ukernel; NR]; MR_DIV_N];
+
+        pub const H_M: usize = 0;
+        pub const H_N: usize = 0;
+        pub const H_UKR: [[gemm_common::microkernel::HMicroKernelFn<T>; H_N]; H_M] = [];
+
+        // `accum_re[i + j * MR]` / `accum_im[i + j * MR]` receive the real and
+        // imaginary parts of `sum_kk lhs[kk * lhs_step + i] * rhs[kk * rhs_step + j]`.
+        // `za0`/`za1` hold the real/imaginary parts of columns 0-7, `za2`/`za3` those
+        // of columns 8-15; one tile column is 8 contiguous `f64` (= `MR`), so a
+        // column spills with one `st1d` and a 64 byte stride.
+        core::arch::global_asm!(
+            r#"
+            .arch_extension sme
+            .arch_extension sme-f64f64
+            .text
+            .globl  _t4a_gemm_c64_sme_ukr
+            .p2align 4
+            _t4a_gemm_c64_sme_ukr:
+                // x0 = k, x1 = lhs, x2 = rhs, x3 = lhs_step, x4 = rhs_step,
+                // x5 = accum_re, x6 = accum_im, w7 = conj flags (bit 0 lhs, bit 1 rhs)
+                smstart
+                // p2 = all true iff conj(lhs), p3 = all true iff conj(rhs)
+                pfalse  p2.b
+                pfalse  p3.b
+                tbz     w7, #0, 10f
+                ptrue   p2.d
+            10:
+                tbz     w7, #1, 11f
+                ptrue   p3.d
+            11:
+                zero    {{za}}
+                ptrue   p0.d
+                ptrue   p1.d
+            1:
+                ldr     z0, [x1]
+                ldr     z1, [x1, #1, mul vl]
+                ldr     z4, [x2]
+                ldr     z5, [x2, #1, mul vl]
+                uzp1    z2.d, z0.d, z1.d        // Lr: real part of rows 0-7
+                uzp2    z3.d, z0.d, z1.d        // Li: imaginary part of rows 0-7
+                uzp1    z6.d, z4.d, z5.d        // Rr: real part of columns 0-7
+                uzp2    z7.d, z4.d, z5.d        // Ri: imaginary part of columns 0-7
+                fneg    z3.d, p2/m, z3.d        // conj(lhs)
+                fneg    z7.d, p3/m, z7.d        // conj(rhs)
+                fneg    z16.d, p1/m, z7.d       // -Ri
+                fmopa   za0.d, p0/m, p1/m, z2.d, z6.d   // Re += Lr * Rr
+                fmopa   za0.d, p0/m, p1/m, z3.d, z16.d  // Re += Li * -Ri
+                fmopa   za1.d, p0/m, p1/m, z2.d, z7.d   // Im += Lr * Ri
+                fmopa   za1.d, p0/m, p1/m, z3.d, z6.d   // Im += Li * Rr
+                ldr     z4, [x2, #2, mul vl]
+                ldr     z5, [x2, #3, mul vl]
+                uzp1    z6.d, z4.d, z5.d        // Rr: columns 8-15
+                uzp2    z7.d, z4.d, z5.d        // Ri: columns 8-15
+                fneg    z7.d, p3/m, z7.d
+                fneg    z16.d, p1/m, z7.d
+                fmopa   za2.d, p0/m, p1/m, z2.d, z6.d
+                fmopa   za2.d, p0/m, p1/m, z3.d, z16.d
+                fmopa   za3.d, p0/m, p1/m, z2.d, z7.d
+                fmopa   za3.d, p0/m, p1/m, z3.d, z6.d
+                add     x1, x1, x3
+                add     x2, x2, x4
+                subs    x0, x0, #1
+                b.ne    1b
+                // spill: x5 walks the real parts, x6 the imaginary parts, x8 the
+                // 64 byte column stride, w12 the tile column, x10 counts the 8 columns
+                mov     x8, #64
+                mov     w12, #0
+                mov     x10, #8
+            20:
+                st1d    {{za0v.d[w12, 0]}}, p0, [x5]
+                add     x5, x5, x8
+                add     w12, w12, #1
+                subs    x10, x10, #1
+                b.ne    20b
+                mov     w12, #0
+                mov     x10, #8
+            21:
+                st1d    {{za1v.d[w12, 0]}}, p0, [x6]
+                add     x6, x6, x8
+                add     w12, w12, #1
+                subs    x10, x10, #1
+                b.ne    21b
+                mov     w12, #0
+                mov     x10, #8
+            22:
+                st1d    {{za2v.d[w12, 0]}}, p0, [x5]
+                add     x5, x5, x8
+                add     w12, w12, #1
+                subs    x10, x10, #1
+                b.ne    22b
+                mov     w12, #0
+                mov     x10, #8
+            23:
+                st1d    {{za3v.d[w12, 0]}}, p0, [x6]
+                add     x6, x6, x8
+                add     w12, w12, #1
+                subs    x10, x10, #1
+                b.ne    23b
+                smstop
+                ret
+            "#
+        );
+
+        extern "C" {
+            /// Computes the `MR x NR` complex accumulator block into `accum_re` and
+            /// `accum_im`.
+            fn t4a_gemm_c64_sme_ukr(
+                k: usize,
+                lhs: *const T,
+                rhs: *const T,
+                lhs_step: usize,
+                rhs_step: usize,
+                accum_re: *mut f64,
+                accum_im: *mut f64,
+                conj: usize,
+            );
+        }
+
+        /// `dst := alpha * dst + beta * (lhs * rhs)` for a `MR x NR` complex block.
+        ///
+        /// `n` may be anything in `1..=NR` and `m` anything in `1..=MR`; the
+        /// dispatcher only passes the trailing partial panels and `pack_operands`
+        /// zero-fills the padding, so the accumulators of the unused rows/columns are
+        /// computed and spilled but never read back.
+        pub unsafe fn ukernel(
+            m: usize,
+            n: usize,
+            k: usize,
+            dst: *mut T,
+            packed_lhs: *const T,
+            packed_rhs: *const T,
+            dst_cs: isize,
+            dst_rs: isize,
+            lhs_cs: isize,
+            rhs_rs: isize,
+            rhs_cs: isize,
+            alpha: T,
+            beta: T,
+            alpha_status: u8,
+            conj_dst: bool,
+            conj_lhs: bool,
+            conj_rhs: bool,
+            _next_lhs: *const T,
+        ) {
+            debug_assert_eq!(rhs_cs, 1);
+
+            let mut accum_re = [0.0f64; MR * NR];
+            let mut accum_im = [0.0f64; MR * NR];
+
+            // `z0`-`z7` and `z16` are clobbered by the callee, which the caller may
+            // be using for `alpha`/`beta` (`v0`-`v7` are volatile, `v16`/`z16` is
+            // spelled out because it is not part of `clobber_abi("C")`).
+            core::arch::asm!(
+                "bl {ukr}",
+                ukr = sym t4a_gemm_c64_sme_ukr,
+                inlateout("x0") k => _,
+                in("x1") packed_lhs,
+                in("x2") packed_rhs,
+                in("x3") (lhs_cs * core::mem::size_of::<T>() as isize) as usize,
+                in("x4") (rhs_rs * core::mem::size_of::<T>() as isize) as usize,
+                in("x5") accum_re.as_mut_ptr(),
+                in("x6") accum_im.as_mut_ptr(),
+                in("x7") (conj_lhs as usize) | ((conj_rhs as usize) << 1),
+                out("z0") _,
+                out("z1") _,
+                out("z2") _,
+                out("z3") _,
+                out("z4") _,
+                out("z5") _,
+                out("z6") _,
+                out("z7") _,
+                out("z16") _,
+                out("p0") _,
+                out("p1") _,
+                out("p2") _,
+                out("p3") _,
+                clobber_abi("C"),
+            );
+
+            // dst := alpha * dst + beta * accum
+            for j in 0..n {
+                for i in 0..m {
+                    let dst = dst.offset(i as isize * dst_rs + j as isize * dst_cs);
+                    let accum = T::new(accum_re[i + j * MR], accum_im[i + j * MR]);
+                    // `conj_dst` applies to the destination, not the product: the
+                    // crate's convention is `dst = alpha * conj(dst) + beta * lhs * rhs`.
+                    let dst0 = if conj_dst { (*dst).conj() } else { *dst };
+                    *dst = match alpha_status {
+                        2 => alpha * dst0 + beta * accum,
+                        1 => dst0 + beta * accum,
+                        _ => beta * accum,
+                    };
+                }
+            }
+        }
+    }
+}

@@ -560,3 +560,217 @@ pub mod simd128 {
         pub const H_UKR: [[gemm_common::microkernel::HMicroKernelFn<T>; H_N]; H_M] = [];
     }
 }
+
+/// Apple SME (`FEAT_SME` + `FEAT_SME_F32F32`) microkernel for `f32`.
+///
+/// Apple Silicon only: this module exists only under
+/// `all(target_vendor = "apple", target_arch = "aarch64", feature = "apple-sme")`.
+/// SME itself is an Armv9 feature, but only Apple's implementation (`svl == 64`,
+/// macOS 26 or newer) has been validated here, so generic aarch64 (Linux) SME is
+/// not supported.
+///
+/// Same shape as the `f64` one in `gemm-f64`: `MR = 16`, `NR = 64` (four `ZA32`
+/// tiles), one `Z` register holds the 16 `f32` of a `ZA32` tile row, and the
+/// kernel is a `global_asm!` function because `#[target_feature(enable = "sme")]`
+/// and the SME intrinsics are still unstable (rust-lang/rust#150244).
+///
+/// The assembly is written with the SME/SVE mnemonics rather than `.inst`
+/// instruction words: `.arch_extension sme` / `.arch_extension sme-f64f64` are
+/// understood by the integrated assembler, so the encodings come from the
+/// assembler instead of being transcribed by hand.
+///
+/// `SMSTART` switches to streaming SVE mode and `SMSTOP` switches back; macOS 26
+/// saves `ZA` and the streaming mode state on a context switch, which is what
+/// makes this safe to use from arbitrary threads.
+#[cfg(all(
+    target_arch = "aarch64",
+    target_vendor = "apple",
+    feature = "std",
+    feature = "apple-sme"
+))]
+pub mod sme {
+    pub mod f32 {
+        pub type T = f32;
+
+        /// `f32` lanes per `Z` register (as wide as one `ZA32` tile row).
+        pub const N: usize = 16;
+        /// `Z` register writes per microkernel row panel: `MR = MR_DIV_N * N = 16`.
+        pub const MR_DIV_N: usize = 1;
+        /// Columns per microkernel invocation: four `ZA32` tiles.
+        pub const NR: usize = 64;
+
+        const MR: usize = MR_DIV_N * N;
+
+        pub const UKR: [[gemm_common::microkernel::MicroKernelFn<T>; NR]; MR_DIV_N] =
+            [[ukernel; NR]; MR_DIV_N];
+
+        pub const H_M: usize = 0;
+        pub const H_N: usize = 0;
+        pub const H_UKR: [[gemm_common::microkernel::HMicroKernelFn<T>; H_N]; H_M] = [];
+
+        // The accumulator block: `accum[i + j * MR]` receives
+        // `sum_kk lhs[kk * lhs_step + i] * rhs[kk * rhs_step + j]`, computed by four
+        // `za32` outer products. One column of a `ZA32` tile is 16 contiguous `f32`,
+        // which is exactly `MR`, so a column is spilled with a single `st1w` and the
+        // spill pointer walks the accumulator block with a 64 byte stride.
+        core::arch::global_asm!(
+            r#"
+            .arch_extension sme
+            .text
+            .globl  _t4a_gemm_f32_sme_ukr
+            .p2align 4
+            _t4a_gemm_f32_sme_ukr:
+                // x0 = k, x1 = lhs, x2 = rhs, x3 = lhs_step, x4 = rhs_step, x5 = accum
+                smstart
+                zero {{za}}
+                ptrue p0.s
+                ptrue p1.s
+            1:
+                ldr     z0, [x1]
+                ldr     z1, [x2]
+                ldr     z2, [x2, #1, mul vl]
+                ldr     z3, [x2, #2, mul vl]
+                ldr     z4, [x2, #3, mul vl]
+                fmopa   za0.s, p0/m, p1/m, z0.s, z1.s
+                fmopa   za1.s, p0/m, p1/m, z0.s, z2.s
+                fmopa   za2.s, p0/m, p1/m, z0.s, z3.s
+                fmopa   za3.s, p0/m, p1/m, z0.s, z4.s
+                add     x1, x1, x3
+                add     x2, x2, x4
+                subs    x0, x0, #1
+                b.ne    1b
+                // spill one column (= MR f32) at a time; x5 walks the tile,
+                // x6 is the column stride, x7 counts the 16 columns, w12 is the slice
+                mov     x6, #64
+                mov     w12, #0
+                mov     x7, #16
+            2:
+                st1w    {{za0v.s[w12, 0]}}, p0, [x5]
+                add     x5, x5, x6
+                add     w12, w12, #1
+                subs    x7, x7, #1
+                b.ne    2b
+                mov     w12, #0
+                mov     x7, #16
+            3:
+                st1w    {{za1v.s[w12, 0]}}, p0, [x5]
+                add     x5, x5, x6
+                add     w12, w12, #1
+                subs    x7, x7, #1
+                b.ne    3b
+                mov     w12, #0
+                mov     x7, #16
+            4:
+                st1w    {{za2v.s[w12, 0]}}, p0, [x5]
+                add     x5, x5, x6
+                add     w12, w12, #1
+                subs    x7, x7, #1
+                b.ne    4b
+                mov     w12, #0
+                mov     x7, #16
+            5:
+                st1w    {{za3v.s[w12, 0]}}, p0, [x5]
+                add     x5, x5, x6
+                add     w12, w12, #1
+                subs    x7, x7, #1
+                b.ne    5b
+                smstop
+                ret
+            "#
+        );
+
+        extern "C" {
+            /// Computes the `MR x NR` accumulator block into `accum`.
+            fn t4a_gemm_f32_sme_ukr(
+                k: usize,
+                lhs: *const T,
+                rhs: *const T,
+                lhs_step: usize,
+                rhs_step: usize,
+                accum: *mut T,
+            );
+        }
+
+        /// `dst := alpha * dst + beta * (lhs * rhs)` for a `MR x NR` block.
+        ///
+        /// `n` may be anything in `1..=NR` and `m` anything in `1..=MR`; the
+        /// dispatcher only passes the trailing partial panels and `pack_operands`
+        /// zero-fills the padding, so the accumulators of the unused rows/columns are
+        /// computed and spilled but never read back.
+        pub unsafe fn ukernel(
+            m: usize,
+            n: usize,
+            k: usize,
+            dst: *mut T,
+            packed_lhs: *const T,
+            packed_rhs: *const T,
+            dst_cs: isize,
+            dst_rs: isize,
+            lhs_cs: isize,
+            rhs_rs: isize,
+            rhs_cs: isize,
+            alpha: T,
+            beta: T,
+            alpha_status: u8,
+            _conj_dst: bool,
+            _conj_lhs: bool,
+            _conj_rhs: bool,
+            _next_lhs: *const T,
+        ) {
+            debug_assert_eq!(rhs_cs, 1);
+
+            let mut accum = [0.0 as T; MR * NR];
+
+            // The callee clobbers the volatile SIMD registers (`z0`-`z4` alias
+            // `v0`-`v4`, which the caller uses for `alpha`/`beta`), so the call goes
+            // through `asm!` with an explicit clobber list instead of a plain
+            // `extern "C"` call.
+            core::arch::asm!(
+                "bl {ukr}",
+                ukr = sym t4a_gemm_f32_sme_ukr,
+                inlateout("x0") k => _,
+                in("x1") packed_lhs,
+                in("x2") packed_rhs,
+                in("x3") (lhs_cs * core::mem::size_of::<T>() as isize) as usize,
+                in("x4") (rhs_rs * core::mem::size_of::<T>() as isize) as usize,
+                in("x5") accum.as_mut_ptr(),
+                out("z0") _,
+                out("z1") _,
+                out("z2") _,
+                out("z3") _,
+                out("z4") _,
+                out("p0") _,
+                out("p1") _,
+                clobber_abi("C"),
+            );
+
+            // dst := alpha * dst + beta * accum
+            match alpha_status {
+                2 => {
+                    for j in 0..n {
+                        for i in 0..m {
+                            let dst = dst.offset(i as isize * dst_rs + j as isize * dst_cs);
+                            *dst = alpha * *dst + beta * accum[i + j * MR];
+                        }
+                    }
+                }
+                1 => {
+                    for j in 0..n {
+                        for i in 0..m {
+                            let dst = dst.offset(i as isize * dst_rs + j as isize * dst_cs);
+                            *dst += beta * accum[i + j * MR];
+                        }
+                    }
+                }
+                _ => {
+                    for j in 0..n {
+                        for i in 0..m {
+                            let dst = dst.offset(i as isize * dst_rs + j as isize * dst_cs);
+                            *dst = beta * accum[i + j * MR];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
