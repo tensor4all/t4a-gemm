@@ -655,8 +655,12 @@ pub unsafe fn gemm_basic_generic<
             }
 
             let func = move |tid, packed_lhs: Ptr<T>| {
+                // Same bound as the caller-owned buffer above: every row chunk is at most `m`,
+                // so `ceil(m / MR)` entries cover the thread-local copy as well. Sizing it by the
+                // cache-derived `mc / MR` made each thread allocate `L2 / (sizeof * MR * kc)`
+                // zeroed bytes per call, which is the allocator traffic #2448 measured.
                 let mut did_pack_lhs_storage =
-                    alloc::vec![false; if tid > 0 { mc / MR } else { 0 }];
+                    alloc::vec![false; if tid > 0 { m.msrv_div_ceil(MR) } else { 0 }];
                 let did_pack_lhs = if tid > 0 {
                     &mut *did_pack_lhs_storage
                 } else {
