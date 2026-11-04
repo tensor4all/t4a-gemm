@@ -487,7 +487,12 @@ pub unsafe fn gemm_basic_generic<
     let packed_rhs_rs = if do_pack_rhs { NR as isize } else { rhs_rs };
     let packed_rhs_cs = if do_pack_rhs { 1 } else { rhs_cs };
 
-    let mut did_pack_lhs = alloc::vec![false; mc / MR];
+    // `did_pack_lhs` is indexed by row mini-chunk (`i` in `0..ceil(m_chunk / MR)`, and
+    // `m_chunk <= m`), so it only ever needs `ceil(m / MR)` entries. Sized by the cache-derived
+    // `mc / MR` instead, a small `k` makes it `L2 / (sizeof * MR * kc)` entries: 5461 zeroed
+    // bytes per call for a 48x48 f64 product on an 8 MiB L2, allocated on every GEMM call that
+    // reaches this path (all targets except x86_64, which has its own kernel).
+    let mut did_pack_lhs = alloc::vec![false; m.msrv_div_ceil(MR)];
     let did_pack_lhs = Ptr((&mut *did_pack_lhs) as *mut _);
 
     let mut col_outer = 0;
