@@ -487,12 +487,15 @@ pub unsafe fn gemm_basic_generic<
     let packed_rhs_rs = if do_pack_rhs { NR as isize } else { rhs_rs };
     let packed_rhs_cs = if do_pack_rhs { 1 } else { rhs_cs };
 
-    // `did_pack_lhs` is indexed by row mini-chunk (`i` in `0..ceil(m_chunk / MR)`, and
-    // `m_chunk <= m`), so it only ever needs `ceil(m / MR)` entries. Sized by the cache-derived
-    // `mc / MR` instead, a small `k` makes it `L2 / (sizeof * MR * kc)` entries: 5461 zeroed
-    // bytes per call for a 48x48 f64 product on an 8 MiB L2, allocated on every GEMM call that
-    // reaches this path (all targets except x86_64, which has its own kernel).
-    let mut did_pack_lhs = alloc::vec![false; m.msrv_div_ceil(MR)];
+    // `did_pack_lhs` is indexed by row mini-chunk: `i` runs `0..ceil(m_chunk / MR)` and
+    // `m_chunk = mc.min(m - row_outer) <= min(m, mc)`, so `ceil(min(m, mc) / MR)` entries cover
+    // every index. Both bounds matter and neither alone is enough: sizing by the cache-derived
+    // `mc / MR` only over-allocates when `m < mc` (a small `k` makes `mc = L2 / (sizeof * kc)`
+    // huge: 5461 zeroed bytes per 48x48 f64 call on an 8 MiB L2), while sizing by `m / MR` lets a
+    // tall product clear a whole-matrix flag buffer on every row chunk, which is quadratic in
+    // `m` because the buffer is refilled (`fill(false)`) inside the `row_outer` loop.
+    let m_rows = m.min(mc);
+    let mut did_pack_lhs = alloc::vec![false; m_rows.msrv_div_ceil(MR)];
     let did_pack_lhs = Ptr((&mut *did_pack_lhs) as *mut _);
 
     let mut col_outer = 0;
@@ -660,7 +663,7 @@ pub unsafe fn gemm_basic_generic<
                 // cache-derived `mc / MR` made each thread allocate `L2 / (sizeof * MR * kc)`
                 // zeroed bytes per call, which is the allocator traffic #2448 measured.
                 let mut did_pack_lhs_storage =
-                    alloc::vec![false; if tid > 0 { m.msrv_div_ceil(MR) } else { 0 }];
+                    alloc::vec![false; if tid > 0 { m_rows.msrv_div_ceil(MR) } else { 0 }];
                 let did_pack_lhs = if tid > 0 {
                     &mut *did_pack_lhs_storage
                 } else {
