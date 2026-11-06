@@ -1,6 +1,6 @@
 [package]
 name = "t4a-gemm-common"
-version = "0.20.3"
+version = "0.20.4"
 edition = "2021"
 authors = ["sarah <>"]
 description = "Playground for matrix multiplication algorithms -- tensor4all fork: adds an Apple Silicon SME (aarch64 + macOS 26) path, everything else is upstream code"
