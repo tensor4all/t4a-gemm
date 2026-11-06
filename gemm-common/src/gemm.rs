@@ -60,6 +60,114 @@ thread_local! {
     pub static L2_SLAB: core::cell::RefCell<dyn_stack::MemBuffer> = core::cell::RefCell::new(dyn_stack::MemBuffer::new(
         StackReq::new_aligned::<u8>(CACHE_INFO[1].cache_bytes, CACHELINE_ALIGN)
     ));
+
+    /// The packed-rhs / prepacked-lhs buffer of the last `gemm_basic_generic` call on this
+    /// thread, kept so that the next call of the same or a smaller size does not allocate.
+    static PACK_BUF: core::cell::Cell<Option<dyn_stack::MemBuffer>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// Owns the per-call packing buffer. Under `std` it is taken out of [`PACK_BUF`] and handed
+/// back on drop.
+///
+/// The buffer is moved out of the slot rather than borrowed because `gemm_basic_generic` holds
+/// it across `par_for_each`, and a rayon worker that blocks there can steal an unrelated job
+/// that calls `gemm_basic_generic` again on the same thread. That nested call finds the slot
+/// empty and allocates its own buffer, so two live calls never share one: there is no
+/// `RefCell` to panic on and no aliasing to reason about.
+#[cfg(feature = "std")]
+struct PackBuffer(Option<dyn_stack::MemBuffer>);
+
+#[cfg(feature = "std")]
+impl PackBuffer {
+    fn take(req: StackReq) -> Self {
+        // `align_bytes() == 0` is dyn-stack's overflow marker; `MemBuffer::new` reports it.
+        if req.align_bytes() != 0 {
+            if let Ok(Some(mut buf)) = PACK_BUF.try_with(|slot| slot.take()) {
+                if DynStack::new(&mut buf).can_hold(req) {
+                    return Self(Some(buf));
+                }
+            }
+        }
+        Self(Some(dyn_stack::MemBuffer::new(req)))
+    }
+}
+
+#[cfg(feature = "std")]
+impl core::ops::Deref for PackBuffer {
+    type Target = [core::mem::MaybeUninit<u8>];
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().unwrap()
+    }
+}
+
+#[cfg(feature = "std")]
+impl core::ops::DerefMut for PackBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.as_mut().unwrap()
+    }
+}
+
+#[cfg(feature = "std")]
+impl Drop for PackBuffer {
+    fn drop(&mut self) {
+        let buf = self.0.take();
+        // Only a buffer up to `CACHE_INFO[1].cache_bytes` is kept, the size of the `L2_SLAB`
+        // this thread already holds, so what a thread pins at most doubles; without a cap every
+        // thread that ever ran a large product would keep that product's buffer. Larger
+        // products still allocate once per call, as before. Between this buffer and one a
+        // nested call left behind (see above) the larger one is kept.
+        let keep = buf.filter(|b| b.len() <= CACHE_INFO[1].cache_bytes);
+        let _ = PACK_BUF.try_with(|slot| {
+            let other = slot.take();
+            slot.set(match (keep, other) {
+                (Some(a), Some(b)) => Some(if a.len() >= b.len() { a } else { b }),
+                (a, b) => a.or(b),
+            });
+        });
+    }
+}
+
+/// Inline capacity of the `did_pack_lhs` flags, in entries (one byte each, one cache line).
+///
+/// The buffer needs `ceil(min(m, mc) / MR)` entries. On the small-product path of
+/// `gemm_basic_generic` (`m <= 64 && n <= 64`) that is at most `m <= 64` whatever `MR` is, and
+/// on the `kernel_params` path `mc <= 8 * MR` (`cache.rs`, the `auto_mc` clamp) bounds it by 8.
+/// So the heap fallback is not reached by today's blocking parameters; it is there so that a
+/// change to them costs an allocation and not a wrong answer.
+const DID_PACK_LHS_INLINE: usize = 64;
+
+/// `did_pack_lhs` storage: inline up to [`DID_PACK_LHS_INLINE`] entries, heap above.
+struct DidPackLhs {
+    inline: [bool; DID_PACK_LHS_INLINE],
+    heap: alloc::vec::Vec<bool>,
+    len: usize,
+}
+
+impl DidPackLhs {
+    #[inline]
+    fn new(len: usize) -> Self {
+        Self {
+            inline: [false; DID_PACK_LHS_INLINE],
+            heap: if len > DID_PACK_LHS_INLINE {
+                alloc::vec![false; len]
+            } else {
+                alloc::vec::Vec::new()
+            },
+            len,
+        }
+    }
+
+    /// Exactly `len` flags, so `fill(false)` per row chunk touches `ceil(min(m, mc) / MR)`
+    /// entries and never more.
+    #[inline]
+    fn as_mut_slice(&mut self) -> &mut [bool] {
+        if self.len > DID_PACK_LHS_INLINE {
+            &mut self.heap
+        } else {
+            &mut self.inline[..self.len]
+        }
+    }
 }
 
 pub trait Conj: Copy {
@@ -417,7 +525,7 @@ pub unsafe fn gemm_basic_generic<
         || (rhs_rs.unsigned_abs() == 1 && m > get_rhs_packing_threshold() * MR);
     let do_prepack_lhs = m <= 2 * mc && ((m % N != 0) || lhs_rs != 1);
 
-    let mut mem = if do_pack_rhs || do_prepack_lhs {
+    let pack_req = if do_pack_rhs || do_prepack_lhs {
         let rhs_req = StackReq::new_aligned::<T>(
             if do_pack_rhs {
                 packed_rhs_stride * (nc / NR)
@@ -434,10 +542,14 @@ pub unsafe fn gemm_basic_generic<
             },
             simd_align,
         );
-        Some(dyn_stack::MemBuffer::new(rhs_req.and(lhs_req)))
+        Some(rhs_req.and(lhs_req))
     } else {
         None
     };
+    #[cfg(feature = "std")]
+    let mut mem = pack_req.map(PackBuffer::take);
+    #[cfg(not(feature = "std"))]
+    let mut mem = pack_req.map(dyn_stack::MemBuffer::new);
 
     #[cfg(not(feature = "std"))]
     let mut l2_slab = dyn_stack::MemBuffer::new(StackReq::new_aligned::<T>(
@@ -495,8 +607,8 @@ pub unsafe fn gemm_basic_generic<
     // tall product clear a whole-matrix flag buffer on every row chunk, which is quadratic in
     // `m` because the buffer is refilled (`fill(false)`) inside the `row_outer` loop.
     let m_rows = m.min(mc);
-    let mut did_pack_lhs = alloc::vec![false; m_rows.msrv_div_ceil(MR)];
-    let did_pack_lhs = Ptr((&mut *did_pack_lhs) as *mut _);
+    let mut did_pack_lhs = DidPackLhs::new(m_rows.msrv_div_ceil(MR));
+    let did_pack_lhs = Ptr(did_pack_lhs.as_mut_slice() as *mut [bool]);
 
     let mut col_outer = 0;
     while col_outer != n {
@@ -658,14 +770,14 @@ pub unsafe fn gemm_basic_generic<
             }
 
             let func = move |tid, packed_lhs: Ptr<T>| {
-                // Same bound as the caller-owned buffer above: every row chunk is at most `m`,
-                // so `ceil(m / MR)` entries cover the thread-local copy as well. Sizing it by the
-                // cache-derived `mc / MR` made each thread allocate `L2 / (sizeof * MR * kc)`
-                // zeroed bytes per call, which is the allocator traffic #2448 measured.
+                // Same bound as the caller-owned buffer above: every row chunk is at most
+                // `min(m, mc)`, so `ceil(min(m, mc) / MR)` entries cover the per-thread copy as
+                // well, and they fit inline (see `DID_PACK_LHS_INLINE`), so a worker thread does
+                // not allocate for them either.
                 let mut did_pack_lhs_storage =
-                    alloc::vec![false; if tid > 0 { m_rows.msrv_div_ceil(MR) } else { 0 }];
+                    DidPackLhs::new(if tid > 0 { m_rows.msrv_div_ceil(MR) } else { 0 });
                 let did_pack_lhs = if tid > 0 {
-                    &mut *did_pack_lhs_storage
+                    did_pack_lhs_storage.as_mut_slice()
                 } else {
                     &mut *({ did_pack_lhs }.0)
                 };

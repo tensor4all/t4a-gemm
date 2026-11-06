@@ -33,3 +33,6 @@ rayon = ["std", "gemm-common/rayon"]
 # Apple Scalable Matrix Extension microkernel (aarch64 + macOS >= 26 only);
 # the kernel needs `sysctl` for the runtime gate, so it implies `std`
 apple-sme = ["std", "gemm-common/apple-sme"]
+
+[dev-dependencies]
+rayon = { workspace = true }
