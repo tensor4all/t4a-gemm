@@ -5,10 +5,17 @@ Playground for testing high performance matrix multiplication.
 ## What this fork changes
 
 Upstream (`sarah-ek/gemm`) code, republished by tensor4all under the `t4a-*`
-crate names. The upstream algorithms, the NEON/x86 dispatch and every benchmark
-are unchanged; the only functional addition is a hand-written **Apple Silicon
-SME** microkernel family for `f64`, `f32`, `c32` and `c64`, plus the `t4a-*`
-rename.
+crate names. Beyond the rename, this fork carries:
+
+- a hand-written **Apple Silicon SME** microkernel family for `f64`, `f32`,
+  `c32` and `c64`, with a measured per-element-type size gate: large calls take
+  SME, small ones stay on NEON (real types) or `neonfcma` (complex types);
+- a per-thread packing buffer on the generic path, shared across calls once
+  warm instead of allocated per call (kept up to the L2 size);
+- `did_pack_lhs` storage sized by `min(m, mc)` and kept inline up to 64
+  entries, so a warm call does not allocate.
+
+The upstream algorithms and benchmark harness are otherwise unchanged.
 
 ### Apple Silicon SME path (fork-only)
 
@@ -22,14 +29,17 @@ target, or with `--no-default-features`, the kernels are not built at all (no
 
 The runtime probe additionally requires `FEAT_SME`, `FEAT_SME_F64F64`
 (`f64`/`c64`) or `FEAT_SME_F32F32` (`f32`/`c32`), `svl == 64` and macOS 26 or
-newer; otherwise dispatch stays on NEON.
+newer; otherwise the gate keeps the call on NEON for real types and `neonfcma`
+for complex types, the same kernels used below the size thresholds.
 
 SME is an Armv9 feature, not an Apple one, but this implementation is
 Apple-Silicon-only on purpose: Linux SME and any future non-Apple
 implementation have not been validated here, and the `ZA` / streaming-mode
 save-restore on a context switch that the `k` loop depends on is an OS
 responsibility that has only been measured on Apple. Generic `aarch64`
-therefore always takes the NEON path.
+therefore never takes SME: real types dispatch to NEON, complex types to
+`neonfcma` when the CPU has FCMA (and to the scalar kernel when NEON is not
+detected).
 
 ### Verified hosts
 
