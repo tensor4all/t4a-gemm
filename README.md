@@ -18,7 +18,9 @@ crate names. Beyond the rename, this fork carries:
 - `did_pack_lhs` storage sized by `min(m, mc)` and kept inline up to 64
   entries, so a warm call does not allocate.
 
-The upstream algorithms and benchmark harness are otherwise unchanged.
+The benchmark harness (`gemm/benches/bench.rs`) is unchanged from upstream
+`86102c5`. Beyond the SME kernels and their tests, the SME size gate, the
+packing changes listed above and the crate rename, the code is upstream's.
 
 ### Apple Silicon SME path (fork-only)
 
@@ -54,8 +56,11 @@ with AMX compiled in. Away from the gate the complex kernels also need
 kernel (`gemm-common/src/gemm.rs:1385-1390`); inside the gate, the fallback is
 `neonfcma` whenever the SME probe passes, with no separate FCMA test (`:1423`).
 Off `aarch64` the kernels are upstream's:
-`avx512f`/`fma`/`scalar` on `x86`/`x86_64` (`:1234-1245`), `simd128`/`scalar` on
-`wasm32` (`:1271-1278`) and `scalar` on any other target (`:1280-1288`).
+`avx512f`/`fma`/`scalar` on `x86`/`x86_64` (`:1234-1245`), `simd128`/`scalar`
+on `wasm32` for the real types (`:1271-1278`) and `scalar` on any other
+target (`:1280-1288`). The complex dispatch has no `wasm32` branch, so
+complex types take the scalar kernel there whatever `simd128` says
+(`:1362-1390`).
 
 ### Verified hosts
 
