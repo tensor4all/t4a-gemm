@@ -8,14 +8,19 @@ Upstream (`sarah-ek/gemm`) code, republished by tensor4all under the `t4a-*`
 crate names. Beyond the rename, this fork carries:
 
 - a hand-written **Apple Silicon SME** microkernel family for `f64`, `f32`,
-  `c32` and `c64`, with a measured per-element-type size gate: large calls take
-  SME, small ones stay on NEON (real types) or `neonfcma` (complex types);
+  `c32` and `c64`, behind a measured size gate: a threshold table per element
+  type, on the shape `(m, n, k)` and not on the element type alone
+  (`gemm-common/src/sme_thresholds.rs:47-67`, called at
+  `gemm-common/src/gemm.rs:1153`), so a large call takes SME and a small one
+  falls back as described below;
 - a per-thread packing buffer on the generic path, shared across calls once
   warm instead of allocated per call (kept up to the L2 size);
 - `did_pack_lhs` storage sized by `min(m, mc)` and kept inline up to 64
   entries, so a warm call does not allocate.
 
-The upstream algorithms and benchmark harness are otherwise unchanged.
+The benchmark harness (`gemm/benches/bench.rs`) is unchanged from upstream
+`86102c5`. Beyond the SME kernels and their tests, the SME size gate, the
+packing changes listed above and the crate rename, the code is upstream's.
 
 ### Apple Silicon SME path (fork-only)
 
@@ -40,6 +45,22 @@ responsibility that has only been measured on Apple. Generic `aarch64`
 therefore never takes SME: real types dispatch to NEON, complex types to
 `neonfcma` when the CPU has FCMA (and to the scalar kernel when NEON is not
 detected).
+
+The fallback is not "NEON" in general. On `aarch64` the AMX kernel is tested
+before NEON when it is compiled in (`experimental-apple-amx`) and the probe
+finds an M1/M2/M3 (`gemm-common/src/cache.rs:198-216`), and once selected it
+takes every size, not only the large ones (`gemm-common/src/gemm.rs:1261-1265`);
+on an SME host the gate comes first, so a small call there stays on NEON even
+with AMX compiled in. Away from the gate the complex kernels also need
+**both** `neon` and `fcma` for `neonfcma`, otherwise they take the scalar
+kernel (`gemm-common/src/gemm.rs:1385-1390`); inside the gate, the fallback is
+`neonfcma` whenever the SME probe passes, with no separate FCMA test (`:1423`).
+Off `aarch64` the kernels are upstream's:
+`avx512f`/`fma`/`scalar` on `x86`/`x86_64` (`:1234-1245`), `simd128`/`scalar`
+on `wasm32` for the real types (`:1271-1278`) and `scalar` on any other
+target (`:1280-1288`). The complex dispatch has no `wasm32` branch, so
+complex types take the scalar kernel there whatever `simd128` says
+(`:1362-1390`).
 
 ### Verified hosts
 
