@@ -73,8 +73,9 @@ thread_local! {
 /// The buffer is moved out of the slot rather than borrowed because `gemm_basic_generic` holds
 /// it across `par_for_each`, and a rayon worker that blocks there can steal an unrelated job
 /// that calls `gemm_basic_generic` again on the same thread. That nested call finds the slot
-/// empty and allocates its own buffer, so two live calls never share one: there is no
-/// `RefCell` to panic on and no aliasing to reason about.
+/// holding no buffer this call owns (empty, or the one a size miss put back) and takes or
+/// allocates its own, so two live calls never share one: there is no `RefCell` to panic on and
+/// no aliasing to reason about.
 #[cfg(feature = "std")]
 struct PackBuffer(Option<dyn_stack::MemBuffer>);
 
@@ -87,6 +88,9 @@ impl PackBuffer {
                 if DynStack::new(&mut buf).can_hold(req) {
                     return Self(Some(buf));
                 }
+                // Put it back instead of dropping it: this call's buffer is allocated below, and
+                // a size miss must not evict a buffer that a later, smaller call fits in.
+                let _ = PACK_BUF.try_with(|slot| slot.set(Some(buf)));
             }
         }
         Self(Some(dyn_stack::MemBuffer::new(req)))
@@ -480,6 +484,13 @@ pub unsafe fn gemm_basic_generic<
             Parallelism::Rayon(_) => n.msrv_next_multiple_of(NR),
         }
     };
+    // A column block wider than the matrix only costs buffer: packing writes at most `n` columns
+    // (`n_chunk = nc.min(n - col_outer)`) and the serial fallback above is `128 * NR` wide
+    // whatever `n` is. Apple reports no L3, so every SME call took that fallback and asked for
+    // `kc * 128 * NR` elements (3.99 MB for `60 x 300` f64) where `kc * ceil(n / NR) * NR` is
+    // all that gets written. With `kernel_params` returning an `nc` that is already at most
+    // `ceil(n / NR) * NR`, this is a no-op; a `Rayon` fallback is the same value too.
+    let nc = nc.min(n.msrv_next_multiple_of(NR));
 
     let simd_align = CACHELINE_ALIGN;
 
