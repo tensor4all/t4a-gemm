@@ -116,15 +116,15 @@ impl core::ops::DerefMut for PackBuffer {
 impl Drop for PackBuffer {
     fn drop(&mut self) {
         let buf = self.0.take();
-        // Only a buffer up to `CACHE_INFO[1].cache_bytes` is kept, the size of the `L2_SLAB`
-        // this thread already holds, so what a thread pins at most doubles; without a cap every
-        // thread that ever ran a large product would keep that product's buffer. Larger
-        // products still allocate once per call, as before. Between this buffer and one a
-        // nested call left behind (see above) the larger one is kept.
-        let keep = buf.filter(|b| b.len() <= CACHE_INFO[1].cache_bytes);
+        // Keep whatever this call allocated: one pack buffer per thread, as large as the largest
+        // pack request that thread has made, and no numeric cap. Capping the kept size at
+        // `CACHE_INFO[1].cache_bytes` made every product above the cap allocate and free a
+        // buffer on every warm call (colmat#169). A thread that once ran a very large product
+        // keeps that request for the life of the thread. Between this buffer and one a nested
+        // call left behind (see above) the larger one is kept.
         let _ = PACK_BUF.try_with(|slot| {
             let other = slot.take();
-            slot.set(match (keep, other) {
+            slot.set(match (buf, other) {
                 (Some(a), Some(b)) => Some(if a.len() >= b.len() { a } else { b }),
                 (a, b) => a.or(b),
             });
