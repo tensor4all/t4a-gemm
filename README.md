@@ -39,7 +39,7 @@ NEON, scalar and SME, and `t4a-gemm-f16`, which calls the same function
 Upstream allocates the packed-`rhs` / prepacked-`lhs` buffer on every call of
 `gemm_basic_generic` that packs. With `std`, the fork moves it out of a thread-local slot
 and hands it back on drop, so the next call on the same thread reuses it when it
-is large enough (`PACK_BUF` and `PackBuffer`, `gemm-common/src/gemm.rs:59-134`).
+is large enough (`PACK_BUF` and `PackBuffer`, `gemm-common/src/gemm.rs:59-132`).
 
 - Why: tenferro-rs#2448 and #2472 measured two heap allocations per call for
   small factorization-sized products on `aarch64` (`gemm-f64/tests/alloc_count.rs`).
@@ -49,15 +49,13 @@ is large enough (`PACK_BUF` and `PackBuffer`, `gemm-common/src/gemm.rs:59-134`).
   `cache.rs`) the serial path falls back to `128 * NR` columns whatever `n` is, so a
   `60 x 300` product asked for ~4 MB of packed `rhs` where ~0.6 MB is written. The number of
   column blocks, the packing work and the results are unchanged; only the request shrinks.
-- Not promised: a buffer larger than the L2 size (`CACHE_INFO[1]`) is not kept,
-  so such products still allocate per call; the clamp above only makes the request as small
-  as the matrix allows. A buffer that *does* fit is no longer dropped when a larger request
-  misses on the same thread (`t4a-gemm#17`): before, one oversized request cost the next small
-  product a second allocation. A nested call on the same thread (a
+- Not promised: there is no size cap. A thread keeps the largest buffer it has allocated,
+  for the life of the thread, so a thread that once ran a very large product keeps that
+  product's request (colmat#169: the `2048 x 2048 x 2048` `c64` cell measured 16.8 MB per
+  call) — nothing shrinks or releases it. A nested call on the same thread (a
   rayon worker that takes another product while it waits) allocates its own.
-  Without `std` nothing changes. Each thread that has run a product keeps up to
-  one L2-sized buffer alive afterwards, in addition to the `L2_SLAB` upstream
-  already keeps per thread.
+  Without `std` nothing changes. Each thread that has run a product keeps one pack buffer
+  alive afterwards, in addition to the `L2_SLAB` upstream already keeps per thread.
 
 ### 3. `did_pack_lhs` sized by `ceil(min(m, mc) / MR)`, inline up to 64
 

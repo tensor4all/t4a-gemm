@@ -51,8 +51,9 @@ struct Case {
     /// `false` stores `lhs` row-major (`lhs_rs = k`), which takes the prepacked-lhs branch.
     lhs_colmajor: bool,
     dst_colmajor: bool,
-    /// `false` stores `rhs` row-major. A column-major `rhs` is what makes the generic path pack
-    /// the RHS on every target (`do_pack_rhs`), so the shapes below use it.
+    /// `true` stores `rhs` as `(cs, rs) = (1, k)`; `rs != 1` is what takes the packed-`rhs`
+    /// branch on non-`aarch64` targets (`do_pack_rhs`). `false` is `(k, 1)`, rows contiguous,
+    /// the layout the kernels read without packing.
     rhs_colmajor: bool,
 }
 
@@ -125,6 +126,19 @@ fn count(c: &Case, ops: &mut Operands, parallelism: Parallelism) -> (usize, usiz
 
 #[test]
 fn warm_generic_gemm_does_not_allocate() {
+    // colmat#169: the pack request is `kc * nc * sizeof` (packed `rhs`) or
+    // `kc * ceil(m / MR) * MR * sizeof` (prepacked `lhs`). Above the retention cap of the day
+    // (one `CACHE_INFO[1]` slice) every warm call allocated; this shape asks for `8.41 MB`
+    // (`kc = 1024`, `nc = ceil(1024 / 6) * 6`), above this host's 1 MiB L2, and packs the `rhs`
+    // (`rhs_colmajor = true` with `m > 2 * MR`; no `lhs` packing: `lhs_rs == 1`, `m % N == 0`).
+    const PACKED_RHS: Case = Case {
+        m: 32,
+        n: 1024,
+        k: 1024,
+        lhs_colmajor: true,
+        dst_colmajor: true,
+        rhs_colmajor: true,
+    };
     // 48 is the size tenferro measured (`faer/{svd,eig,qr}/48`); the rest are the panel
     // shapes a blocked factorization of that size issues, plus both packing branches.
     let cases = [
@@ -184,6 +198,7 @@ fn warm_generic_gemm_does_not_allocate() {
             dst_colmajor: true,
             rhs_colmajor: false,
         },
+        PACKED_RHS,
     ];
     let mut parallelisms = vec![Parallelism::None];
     #[cfg(feature = "rayon")]
@@ -257,7 +272,9 @@ fn warm_generic_gemm_does_not_allocate() {
     // The packing request may only be as large as the matrix needs: `kc <= k`,
     // `nc <= ceil(n / NR) * NR <= n + 16`, prepacked `lhs <= k * (m + 31)` (`MR <= 32`). A host
     // without an L3 (Apple reports `L3 = 0`) used to ask for `kc * 128 * NR` columns instead,
-    // 3.99 MB for `n = 300` where 0.6 MB is written.
+    // 3.99 MB for `n = 300` where 0.6 MB is written. A fresh thread has no buffer to reuse, so
+    // the bytes it allocates are the request itself; keeping the buffer (colmat#169) would
+    // otherwise hide the request behind one an earlier shape kept.
     for (m, n, k) in [(60usize, 300usize, 256usize), (300, 300, 240)] {
         let c = Case {
             m,
@@ -267,10 +284,25 @@ fn warm_generic_gemm_does_not_allocate() {
             dst_colmajor: true,
             rhs_colmajor: true,
         };
-        let mut ops = operands(&c);
-        count(&c, &mut ops, Parallelism::None);
-        ops.dst.fill(0.0);
-        let (_events, bytes) = count(&c, &mut ops, Parallelism::None);
+        let bytes = std::thread::spawn(move || {
+            // The first product on a thread initializes its `L2_SLAB` (one `CACHE_INFO[1]`
+            // slice); this shape packs nothing, so the slab is warm and no pack buffer exists.
+            let warm = Case {
+                m: 48,
+                n: 48,
+                k: 48,
+                lhs_colmajor: true,
+                dst_colmajor: true,
+                rhs_colmajor: false,
+            };
+            let mut ops = operands(&warm);
+            count(&warm, &mut ops, Parallelism::None);
+            let mut ops = operands(&c);
+            ops.dst.fill(0.0);
+            count(&c, &mut ops, Parallelism::None).1
+        })
+        .join()
+        .unwrap();
         let bound = k * ((n + 16) + (m + 32)) * core::mem::size_of::<f64>() + 4096;
         report.push(format!(
             "m={m} n={n} k={k}: bytes={bytes} bound={bound} {}",
@@ -294,4 +326,28 @@ fn warm_generic_gemm_does_not_allocate() {
         })
         .collect();
     assert!(bad.is_empty(), "warm calls allocated:\n{}", bad.join("\n"));
+
+    // The retained buffer must not change the result: the same product on a thread that has no
+    // buffer to reuse (it allocates its own) is bitwise equal to the one that reused it.
+    let mut ops = operands(&PACKED_RHS);
+    ops.dst.fill(0.0);
+    count(&PACKED_RHS, &mut ops, Parallelism::None);
+    ops.dst.fill(0.0);
+    count(&PACKED_RHS, &mut ops, Parallelism::None); // reuses the buffer the call above kept
+    let reused = ops.dst;
+    let fresh = std::thread::spawn(move || {
+        let mut ops = operands(&PACKED_RHS);
+        ops.dst.fill(0.0);
+        count(&PACKED_RHS, &mut ops, Parallelism::None);
+        ops.dst
+    })
+    .join()
+    .unwrap();
+    assert!(
+        reused
+            .iter()
+            .zip(&fresh)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "the retained packing buffer changed a result"
+    );
 }
