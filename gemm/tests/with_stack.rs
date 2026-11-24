@@ -6,7 +6,8 @@
 //! process-wide one-time set-up (the cache sizes, the kernel selection, the SME probe) is done
 //! once on the main thread first: it is not per-thread, so it is not what this test is about.
 
-use dyn_stack::{MemBuffer, MemStack};
+// `dyn_stack` through `gemm`'s re-export: the version `gemm_with_stack` takes.
+use gemm::dyn_stack::{self, MemBuffer, MemStack};
 use gemm::{c32, c64, gemm, gemm_scratch, gemm_with_stack, Parallelism};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -330,8 +331,18 @@ fn fresh_thread_allocations<T: Scalar>(call: Call) -> usize {
                     stack,
                 )
             };
+            let n_alloc = ALLOCS.load(Ordering::Relaxed) - before;
+            // Positive control: an allocation on this thread, in the same counted region, is
+            // seen. Without it, a counter that never counted would pass every shape with 0.
+            drop(std::hint::black_box(Box::new(0u64)));
+            let with_control = ALLOCS.load(Ordering::Relaxed) - before;
             COUNTED.with(|c| c.set(false));
-            ALLOCS.load(Ordering::Relaxed) - before
+            assert_eq!(
+                with_control,
+                n_alloc + 1,
+                "the counting allocator missed a known allocation"
+            );
+            n_alloc
         })
         .join()
         .unwrap()
@@ -458,19 +469,57 @@ fn matches_gemm_bit_for_bit_within_the_bound() {
     matches_gemm::<c32>(4);
 }
 
+/// A stack too short for the packing buffers panics in `MemStack::make_aligned_uninit`, and
+/// `dst` is not written: the call is caught, and `dst` compared bit for bit with its value
+/// before.
 #[test]
-#[should_panic(expected = "cannot hold gemm_scratch")]
-fn a_short_stack_panics() {
-    let mut buf = MemBuffer::new(dyn_stack::StackReq::new::<u8>(16));
-    let call = Call {
-        m: 300,
-        n: 200,
-        k: 150,
-        dst: Layout2::PLAIN,
-        lhs: Layout2::PLAIN,
-        rhs: Layout2::PLAIN,
-        read_dst: false,
-        conj: (false, false, false),
-    };
-    let _ = run::<f64>(call, 1, Some(MemStack::new(&mut buf)));
+fn a_short_stack_panics_before_dst_is_written() {
+    let (m, n, k) = (300, 200, 150);
+    let mut rng = Rng(1);
+    let mut dst = Mat::<f64>::new(&mut rng, m, n, Layout2::PLAIN);
+    let lhs = Mat::<f64>::new(&mut rng, m, k, Layout2::PLAIN);
+    let rhs = Mat::<f64>::new(&mut rng, k, n, Layout2::PLAIN);
+    let before: Vec<u64> = dst.buf.iter().map(|x| x.to_bits()).collect();
+    let need = gemm_scratch::<f64>(m, n, k, Parallelism::None).size_bytes();
+    assert!(need > 0);
+    // `need` covers both orientations; the call takes less, but more than 16 bytes.
+    for len in [0, 16] {
+        let mut buf = MemBuffer::new(dyn_stack::StackReq::new::<u8>(len));
+        let dst_ptr = dst.ptr_mut();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            gemm_with_stack(
+                m,
+                n,
+                k,
+                dst_ptr,
+                dst.cs,
+                dst.rs,
+                true,
+                lhs.ptr(),
+                lhs.cs,
+                lhs.rs,
+                rhs.ptr(),
+                rhs.cs,
+                rhs.rs,
+                1.0,
+                1.0,
+                false,
+                false,
+                false,
+                Parallelism::None,
+                MemStack::new(&mut buf),
+            )
+        }));
+        let message = result
+            .expect_err("a short stack panics")
+            .downcast::<String>()
+            .map(|s| *s)
+            .unwrap_or_default();
+        assert!(
+            message.contains("buffer is not large enough"),
+            "{len} bytes: {message}"
+        );
+        let after: Vec<u64> = dst.buf.iter().map(|x| x.to_bits()).collect();
+        assert!(before == after, "{len} bytes: dst was written");
+    }
 }

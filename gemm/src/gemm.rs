@@ -267,8 +267,12 @@ pub fn gemm_scratch<T: 'static>(
 ///
 /// # Panics
 ///
-/// Panics if `T` is not `f32`, `f64`, `gemm::c32`, or `gemm::c64`, or if `stack` cannot hold
-/// [`gemm_scratch::<T>(m, n, k, parallelism)`](gemm_scratch), before `dst` is written.
+/// Panics if `T` is not `f32`, `f64`, `gemm::c32`, or `gemm::c64`, or if `stack` is too short
+/// for the packing buffers the call takes, before `dst` is written. Those buffers are never
+/// more than [`gemm_scratch::<T>(m, n, k, parallelism)`](gemm_scratch); a call that takes none
+/// (an empty product, `k == 0`, a matrix-vector product, some small products) does not look at
+/// `stack`. The length of `stack` is not checked against `gemm_scratch` up front, as that
+/// would cost a second blocking computation on every call.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm_with_stack<T: 'static>(
     m: usize,
@@ -292,11 +296,10 @@ pub unsafe fn gemm_with_stack<T: 'static>(
     parallelism: Parallelism,
     stack: &mut dyn_stack::MemStack,
 ) {
-    let req = gemm_scratch::<T>(m, n, k, parallelism);
-    assert!(
-        stack.can_hold(req),
-        "gemm_with_stack: the stack cannot hold gemm_scratch"
-    );
+    // No `can_hold(gemm_scratch(..))` check here: it would cost a second blocking computation
+    // on every call, which made an `f64` 8 x 8 x 8 call about 1.5 times as long. A short
+    // `stack` makes `MemStack::make_aligned_uninit` panic instead, when the buffers are taken,
+    // before `dst` is written.
     gemm_imp(
         m,
         n,

@@ -6,6 +6,8 @@ mod gemm;
 #[cfg(feature = "f16")]
 pub use crate::gemm::f16;
 pub use crate::gemm::{c32, c64, gemm, gemm_scratch, gemm_with_stack};
+/// The `dyn-stack` version of [`gemm_with_stack`]'s `stack` and [`gemm_scratch`]'s result.
+pub use gemm_common::dyn_stack;
 pub use gemm_common::Parallelism;
 
 pub use gemm_common::gemm::{

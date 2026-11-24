@@ -115,6 +115,13 @@ nothing, a thread's first call and products larger than L2 included.
 - The two entries share one code path (`gemm_basic_generic_with_stack`, with `None` for
   `gemm`), so `gemm_with_stack` gives bit-for-bit `gemm`'s result: the kernel, the blocking
   and the packing are the same, only where the packed operands live differs.
+- A stack too short for the buffers a call takes panics in `MemStack::make_aligned_uninit`,
+  before `dst` is written. `gemm_with_stack` does not check the stack against `gemm_scratch`
+  up front: that is a second blocking computation on every call, which made an `f64`
+  `8 x 8 x 8` call about 1.5 times as long. A call that takes no buffer (an empty product,
+  `k == 0`, a matrix-vector product, some small products) does not look at the stack.
+- `gemm` re-exports `dyn_stack` (`gemm::dyn_stack`), the version of `MemStack` and
+  `StackReq` the two functions use.
 - `Parallelism::Rayon`: `gemm_with_stack` is `gemm`, with the thread-local buffers of every
   worker, and `gemm_scratch` is empty. `f16` is not supported (its kernels allocate their own
   buffers), and both functions panic for it.
@@ -125,7 +132,9 @@ nothing, a thread's first call and products larger than L2 included.
   four types, on shapes on both sides of the L2 size, of the SME gate and of the small-product
   blocking; and random shapes and layouts give bit-for-bit `gemm`'s result on a stack of
   exactly `gemm_scratch`. The process-wide one-time set-up (cache sizes, kernel selection, the
-  SME probe) is done before the counted call.
+  SME probe) is done before the counted call, and every counted call is followed, in the same
+  counted region, by one known allocation that must be counted. A stack of 0 or 16 bytes
+  panics, and `dst` is compared bit for bit with its value before the call.
 
 ### 6. Public API differences
 
@@ -142,7 +151,7 @@ nothing, a thread's first call and products larger than L2 included.
   `gemm_common::cache::HasAppleSme` (Apple `aarch64` with `apple-sme` only).
 - `gemm_c32::microkernel` and `gemm_c64::microkernel` are `pub`; upstream keeps
   them private (`f32`/`f64` were already `pub`).
-- `gemm::gemm_scratch` and `gemm::gemm_with_stack` (change 5); in `gemm-common`,
+- `gemm::gemm_scratch`, `gemm::gemm_with_stack` and `gemm::dyn_stack` (change 5); in `gemm-common`,
   `gemm::gemm_basic_generic_with_stack`, `gemm::gemm_scratch_generic` and the re-export of
   `dyn_stack`; in each `gemm_def!`/`gemm_cplx_def!` module, `get_gemm_with_stack_fn` and
   `gemm_scratch` next to `get_gemm_fn`, whose type is unchanged.
