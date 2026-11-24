@@ -29,9 +29,14 @@ unsafe fn gemm_dispatch<T: 'static>(
     conj_lhs: bool,
     conj_rhs: bool,
     parallelism: Parallelism,
+    stack: Option<&mut dyn_stack::MemStack>,
 ) {
     #[cfg(feature = "f16")]
     if TypeId::of::<T>() == TypeId::of::<f16>() {
+        assert!(
+            stack.is_none(),
+            "gemm_with_stack does not support f16: its kernels allocate their own buffers"
+        );
         return gemm_f16::gemm::f16::get_gemm_fn()(
             m,
             n,
@@ -56,7 +61,7 @@ unsafe fn gemm_dispatch<T: 'static>(
     }
 
     if TypeId::of::<T>() == TypeId::of::<f64>() {
-        gemm_f64::gemm::f64::get_gemm_fn()(
+        gemm_f64::gemm::f64::get_gemm_with_stack_fn()(
             m,
             n,
             k,
@@ -76,9 +81,10 @@ unsafe fn gemm_dispatch<T: 'static>(
             false,
             false,
             parallelism,
+            stack,
         )
     } else if TypeId::of::<T>() == TypeId::of::<f32>() {
-        gemm_f32::gemm::f32::get_gemm_fn()(
+        gemm_f32::gemm::f32::get_gemm_with_stack_fn()(
             m,
             n,
             k,
@@ -98,9 +104,10 @@ unsafe fn gemm_dispatch<T: 'static>(
             false,
             false,
             parallelism,
+            stack,
         )
     } else if TypeId::of::<T>() == TypeId::of::<c64>() {
-        gemm_c64::gemm::f64::get_gemm_fn()(
+        gemm_c64::gemm::f64::get_gemm_with_stack_fn()(
             m,
             n,
             k,
@@ -120,9 +127,10 @@ unsafe fn gemm_dispatch<T: 'static>(
             conj_lhs,
             conj_rhs,
             parallelism,
+            stack,
         )
     } else if TypeId::of::<T>() == TypeId::of::<c32>() {
-        gemm_c32::gemm::f32::get_gemm_fn()(
+        gemm_c32::gemm::f32::get_gemm_with_stack_fn()(
             m,
             n,
             k,
@@ -142,6 +150,7 @@ unsafe fn gemm_dispatch<T: 'static>(
             conj_lhs,
             conj_rhs,
             parallelism,
+            stack,
         )
     } else {
         panic!();
@@ -150,10 +159,174 @@ unsafe fn gemm_dispatch<T: 'static>(
 
 /// dst := alpha×dst + beta×lhs×rhs
 ///
+/// Under `std` the packing buffers are thread-locals of `gemm-common`: a call allocates on a
+/// thread's first call and when a product needs more than the buffer that thread holds.
+/// [`gemm_with_stack`] takes them from the caller instead.
+///
 /// # Panics
 ///
 /// Panics if `T` is not `f32`, `f64`, `gemm::f16`, `gemm::c32`, or `gemm::c64`.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn gemm<T: 'static>(
+    m: usize,
+    n: usize,
+    k: usize,
+    dst: *mut T,
+    dst_cs: isize,
+    dst_rs: isize,
+    read_dst: bool,
+    lhs: *const T,
+    lhs_cs: isize,
+    lhs_rs: isize,
+    rhs: *const T,
+    rhs_cs: isize,
+    rhs_rs: isize,
+    alpha: T,
+    beta: T,
+    conj_dst: bool,
+    conj_lhs: bool,
+    conj_rhs: bool,
+    parallelism: Parallelism,
+) {
+    gemm_imp(
+        m,
+        n,
+        k,
+        dst,
+        dst_cs,
+        dst_rs,
+        read_dst,
+        lhs,
+        lhs_cs,
+        lhs_rs,
+        rhs,
+        rhs_cs,
+        rhs_rs,
+        alpha,
+        beta,
+        conj_dst,
+        conj_lhs,
+        conj_rhs,
+        parallelism,
+        None,
+    )
+}
+
+/// An upper bound on the scratch [`gemm_with_stack::<T>`](gemm_with_stack) needs for an
+/// `m x n x k` product with `parallelism`, whatever the strides and whichever kernel the
+/// dispatch picks (both orientations, a packed rhs and a prepacked or packed lhs, and every
+/// kernel compiled for the target, the SME kernels included). It depends on `T`, the shape and
+/// the host's cache sizes only.
+///
+/// It is empty for `Parallelism::Rayon`, whose calls still use the thread-local buffers (see
+/// [`gemm_with_stack`]).
+///
+/// # Panics
+///
+/// Panics if `T` is not `f32`, `f64`, `gemm::c32`, or `gemm::c64`.
+pub fn gemm_scratch<T: 'static>(
+    m: usize,
+    n: usize,
+    k: usize,
+    parallelism: Parallelism,
+) -> dyn_stack::StackReq {
+    #[cfg(feature = "rayon")]
+    if let Parallelism::Rayon(_) = parallelism {
+        return dyn_stack::StackReq::EMPTY;
+    }
+    let _ = parallelism;
+    let one = |m, n| {
+        if TypeId::of::<T>() == TypeId::of::<f64>() {
+            gemm_f64::gemm::f64::gemm_scratch(m, n, k)
+        } else if TypeId::of::<T>() == TypeId::of::<f32>() {
+            gemm_f32::gemm::f32::gemm_scratch(m, n, k)
+        } else if TypeId::of::<T>() == TypeId::of::<c64>() {
+            gemm_c64::gemm::f64::gemm_scratch(m, n, k)
+        } else if TypeId::of::<T>() == TypeId::of::<c32>() {
+            gemm_c32::gemm::f32::gemm_scratch(m, n, k)
+        } else {
+            panic!("gemm_scratch supports f32, f64, c32 and c64");
+        }
+    };
+    // `gemm` transposes the product when `dst` is closer to row-major
+    one(m, n).or(one(n, m))
+}
+
+/// [`gemm`], with its working memory taken from `stack` for `Parallelism::None`: the call
+/// neither touches the thread-local buffers of `gemm-common` nor allocates, from a thread's
+/// first call on, provided `stack` holds [`gemm_scratch::<T>(m, n, k,
+/// parallelism)`](gemm_scratch). The result is bit-for-bit that of [`gemm`]: the kernel, the
+/// blocking and the packing are the same; only where the packed operands live differs.
+///
+/// With `Parallelism::Rayon` the call is [`gemm`]: it still uses the thread-local buffers of
+/// each worker, and `stack` is not used.
+///
+/// # Safety
+///
+/// The same as [`gemm`].
+///
+/// # Panics
+///
+/// Panics if `T` is not `f32`, `f64`, `gemm::c32`, or `gemm::c64`, or if `stack` is too short
+/// for the packing buffers the call takes, before `dst` is written. Those buffers are never
+/// more than [`gemm_scratch::<T>(m, n, k, parallelism)`](gemm_scratch); a call that takes none
+/// (an empty product, `k == 0`, a matrix-vector product, some small products) does not look at
+/// `stack`. The length of `stack` is not checked against `gemm_scratch` up front, as that
+/// would cost a second blocking computation on every call.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_with_stack<T: 'static>(
+    m: usize,
+    n: usize,
+    k: usize,
+    dst: *mut T,
+    dst_cs: isize,
+    dst_rs: isize,
+    read_dst: bool,
+    lhs: *const T,
+    lhs_cs: isize,
+    lhs_rs: isize,
+    rhs: *const T,
+    rhs_cs: isize,
+    rhs_rs: isize,
+    alpha: T,
+    beta: T,
+    conj_dst: bool,
+    conj_lhs: bool,
+    conj_rhs: bool,
+    parallelism: Parallelism,
+    stack: &mut dyn_stack::MemStack,
+) {
+    // No `can_hold(gemm_scratch(..))` check here: it would cost a second blocking computation
+    // on every call, which made an `f64` 8 x 8 x 8 call about 1.5 times as long. A short
+    // `stack` makes `MemStack::make_aligned_uninit` panic instead, when the buffers are taken,
+    // before `dst` is written.
+    gemm_imp(
+        m,
+        n,
+        k,
+        dst,
+        dst_cs,
+        dst_rs,
+        read_dst,
+        lhs,
+        lhs_cs,
+        lhs_rs,
+        rhs,
+        rhs_cs,
+        rhs_rs,
+        alpha,
+        beta,
+        conj_dst,
+        conj_lhs,
+        conj_rhs,
+        parallelism,
+        Some(stack),
+    )
+}
+
+/// `gemm` and `gemm_with_stack`: one code path, with or without a caller's stack.
+#[allow(clippy::too_many_arguments)]
+unsafe fn gemm_imp<T: 'static>(
     m: usize,
     n: usize,
     k: usize,
@@ -173,6 +346,7 @@ pub unsafe fn gemm<T: 'static>(
     conj_lhs: bool,
     conj_rhs: bool,
     parallelism: Parallelism,
+    stack: Option<&mut dyn_stack::MemStack>,
 ) {
     // we want to transpose if the destination is column-oriented, since the microkernel prefers
     // column major matrices.
@@ -242,6 +416,7 @@ pub unsafe fn gemm<T: 'static>(
         conj_lhs,
         conj_rhs,
         parallelism,
+        stack,
     )
 }
 

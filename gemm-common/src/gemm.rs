@@ -282,8 +282,183 @@ pub fn par_for_each(n_threads: usize, func: impl Fn(usize) + Send + Sync) {
     inner(n_threads, &func)
 }
 
+/// The blocking of `gemm_basic_generic` for an `m x n x k` product with register blocks of
+/// `MR x NR`: one function, so that the call and [`gemm_scratch_generic`] cannot disagree.
+#[inline(always)]
+fn block_params<T, const MR: usize, const NR: usize>(
+    m: usize,
+    n: usize,
+    k: usize,
+    parallelism: Parallelism,
+) -> KernelParams {
+    let KernelParams { kc, mc, nc } = if m <= 64 && n <= 64 {
+        // skip expensive kernel_params call for small sizes
+        let kc = k.min(512);
+        let alloc = CACHE_INFO[1].cache_bytes / core::mem::size_of::<T>();
+        let mc = (alloc / kc) / MR * MR;
+
+        KernelParams {
+            kc,
+            mc,
+            nc: n.msrv_next_multiple_of(NR),
+        }
+    } else {
+        kernel_params(m, n, k, MR, NR, core::mem::size_of::<T>())
+    };
+    let nc = if nc > 0 {
+        nc
+    } else {
+        match parallelism {
+            Parallelism::None => 128 * NR,
+            #[cfg(feature = "rayon")]
+            Parallelism::Rayon(_) => n.msrv_next_multiple_of(NR),
+        }
+    };
+    // A column block wider than the matrix only costs buffer: packing writes at most `n` columns
+    // (`n_chunk = nc.min(n - col_outer)`) and the serial fallback above is `128 * NR` wide
+    // whatever `n` is. Apple reports no L3, so every SME call took that fallback and asked for
+    // `kc * 128 * NR` elements (3.99 MB for `60 x 300` f64) where `kc * ceil(n / NR) * NR` is
+    // all that gets written. With `kernel_params` returning an `nc` that is already at most
+    // `ceil(n / NR) * NR`, this is a no-op; a `Rayon` fallback is the same value too.
+    let nc = nc.min(n.msrv_next_multiple_of(NR));
+    KernelParams { kc, mc, nc }
+}
+
+/// The three buffers `gemm_basic_generic` takes from a caller's stack, in elements: the packed
+/// rhs, the prepacked lhs and the packed lhs block (`L2_SLAB` on the thread-local path).
+#[inline(always)]
+fn stack_lens<const MR: usize, const NR: usize>(
+    m: usize,
+    KernelParams { kc, mc, nc }: KernelParams,
+    do_pack_rhs: bool,
+    do_prepack_lhs: bool,
+) -> (usize, usize, usize) {
+    let rhs = if do_pack_rhs { kc * NR * (nc / NR) } else { 0 };
+    // `do_prepack_lhs` implies `m <= 2 * mc`
+    let prepacked_lhs = if do_prepack_lhs {
+        kc * MR * (m.min(2 * mc).msrv_next_multiple_of(MR) / MR)
+    } else {
+        0
+    };
+    // every row chunk is at most `min(m, mc)` rows: `ceil(min(m, mc) / MR)` panels
+    let packed_lhs = if do_prepack_lhs {
+        0
+    } else {
+        kc * MR * m.min(mc).msrv_div_ceil(MR)
+    };
+    (rhs, prepacked_lhs, packed_lhs)
+}
+
+/// An upper bound on the stack `gemm_basic_generic::<_, T, _, MR, NR, ..>` takes from its
+/// caller for an `m x n x k` product with `Parallelism::None`, whatever the strides: it assumes
+/// that the rhs is packed and that the lhs is both prepacked and packed, which no call does at
+/// once. The early paths (`k == 0`, the horizontal kernel, `gevv`, `gemv`) take nothing.
+pub fn gemm_scratch_generic<T, const MR: usize, const NR: usize>(
+    m: usize,
+    n: usize,
+    k: usize,
+) -> StackReq {
+    if m == 0 || n == 0 || k == 0 {
+        return StackReq::EMPTY;
+    }
+    let params = block_params::<T, MR, NR>(m, n, k, Parallelism::None);
+    let (rhs, _, _) = stack_lens::<MR, NR>(m, params, true, false);
+    let (_, prepacked_lhs, _) = stack_lens::<MR, NR>(m, params, false, true);
+    let (_, _, packed_lhs) = stack_lens::<MR, NR>(m, params, false, false);
+    StackReq::new_aligned::<T>(rhs, CACHELINE_ALIGN)
+        .and(StackReq::new_aligned::<T>(prepacked_lhs, CACHELINE_ALIGN))
+        .and(StackReq::new_aligned::<T>(packed_lhs, CACHELINE_ALIGN))
+}
+
 #[inline(always)]
 pub unsafe fn gemm_basic_generic<
+    S: MixedSimd<T, T, T, T>,
+    T: Copy
+        + Zero
+        + One
+        + Conj
+        + Send
+        + Sync
+        + core::fmt::Debug
+        + core::ops::Add<Output = T>
+        + core::ops::Mul<Output = T>
+        + core::cmp::PartialEq
+        + 'static,
+    const N: usize,
+    const MR: usize,
+    const NR: usize,
+    const MR_DIV_N: usize,
+    const H_M: usize,
+    const H_N: usize,
+>(
+    simd: S,
+    m: usize,
+    n: usize,
+    k: usize,
+    dst: *mut T,
+    dst_cs: isize,
+    dst_rs: isize,
+    read_dst: bool,
+    lhs: *const T,
+    lhs_cs: isize,
+    lhs_rs: isize,
+    rhs: *const T,
+    rhs_cs: isize,
+    rhs_rs: isize,
+    alpha: T,
+    beta: T,
+    conj_dst: bool,
+    conj_lhs: bool,
+    conj_rhs: bool,
+    mul_add: impl Copy + Fn(T, T, T) -> T,
+    dispatcher: &[[MicroKernelFn<T>; NR]; MR_DIV_N],
+    horizontal_dispatcher: &[[HMicroKernelFn<T>; H_N]; H_M],
+    _requires_row_major_rhs: bool,
+    parallelism: Parallelism,
+) {
+    gemm_basic_generic_with_stack::<S, T, N, MR, NR, MR_DIV_N, H_M, H_N>(
+        simd,
+        m,
+        n,
+        k,
+        dst,
+        dst_cs,
+        dst_rs,
+        read_dst,
+        lhs,
+        lhs_cs,
+        lhs_rs,
+        rhs,
+        rhs_cs,
+        rhs_rs,
+        alpha,
+        beta,
+        conj_dst,
+        conj_lhs,
+        conj_rhs,
+        mul_add,
+        dispatcher,
+        horizontal_dispatcher,
+        _requires_row_major_rhs,
+        parallelism,
+        None,
+    )
+}
+
+/// [`gemm_basic_generic`], with the packing buffers taken from `stack` when it is given and
+/// `parallelism` is `Parallelism::None`: `stack` must then hold
+/// [`gemm_scratch_generic::<T, MR, NR>(m, n, k)`](gemm_scratch_generic), and neither `PACK_BUF`
+/// nor `L2_SLAB` is touched. Otherwise the buffers are the thread-locals (with `std`), as in
+/// `gemm_basic_generic`.
+///
+/// # Safety
+///
+/// The same as `gemm_basic_generic`: the pointers and strides describe valid `m x n`, `m x k`
+/// and `k x n` matrices, `dst` is not aliased by `lhs` or `rhs`, and, when `stack` is given
+/// with `Parallelism::None`, it holds `gemm_scratch_generic::<T, MR, NR>(m, n, k)`.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub unsafe fn gemm_basic_generic_with_stack<
     S: MixedSimd<T, T, T, T>,
     T: Copy
         + Zero
@@ -327,6 +502,7 @@ pub unsafe fn gemm_basic_generic<
     horizontal_dispatcher: &[[HMicroKernelFn<T>; H_N]; H_M],
     _requires_row_major_rhs: bool,
     parallelism: Parallelism,
+    stack: Option<&mut dyn_stack::MemStack>,
 ) {
     if m == 0 || n == 0 {
         return;
@@ -461,36 +637,8 @@ pub unsafe fn gemm_basic_generic<
         }
     }
 
-    let KernelParams { kc, mc, nc } = if m <= 64 && n <= 64 {
-        // skip expensive kernel_params call for small sizes
-        let kc = k.min(512);
-        let alloc = CACHE_INFO[1].cache_bytes / core::mem::size_of::<T>();
-        let mc = (alloc / kc) / MR * MR;
-
-        KernelParams {
-            kc,
-            mc,
-            nc: n.msrv_next_multiple_of(NR),
-        }
-    } else {
-        kernel_params(m, n, k, MR, NR, core::mem::size_of::<T>())
-    };
-    let nc = if nc > 0 {
-        nc
-    } else {
-        match parallelism {
-            Parallelism::None => 128 * NR,
-            #[cfg(feature = "rayon")]
-            Parallelism::Rayon(_) => n.msrv_next_multiple_of(NR),
-        }
-    };
-    // A column block wider than the matrix only costs buffer: packing writes at most `n` columns
-    // (`n_chunk = nc.min(n - col_outer)`) and the serial fallback above is `128 * NR` wide
-    // whatever `n` is. Apple reports no L3, so every SME call took that fallback and asked for
-    // `kc * 128 * NR` elements (3.99 MB for `60 x 300` f64) where `kc * ceil(n / NR) * NR` is
-    // all that gets written. With `kernel_params` returning an `nc` that is already at most
-    // `ceil(n / NR) * NR`, this is a no-op; a `Rayon` fallback is the same value too.
-    let nc = nc.min(n.msrv_next_multiple_of(NR));
+    let params = block_params::<T, MR, NR>(m, n, k, parallelism);
+    let KernelParams { kc, mc, nc } = params;
 
     let simd_align = CACHELINE_ALIGN;
 
@@ -557,6 +705,32 @@ pub unsafe fn gemm_basic_generic<
     } else {
         None
     };
+    // With a caller's stack (`Parallelism::None` only), every buffer below comes from it, and
+    // neither `PACK_BUF` nor `L2_SLAB` is touched.
+    let stack = match parallelism {
+        Parallelism::None => stack,
+        #[cfg(feature = "rayon")]
+        Parallelism::Rayon(_) => None,
+    };
+    let mut stack_packed_lhs = None;
+    let stack_storage = stack.map(|stack| {
+        let (rhs_len, prepacked_lhs_len, packed_lhs_len) =
+            stack_lens::<MR, NR>(m, params, do_pack_rhs, do_prepack_lhs);
+        let (rhs, stack) = stack.make_aligned_uninit::<T>(rhs_len, simd_align);
+        let (prepacked_lhs, stack) = stack.make_aligned_uninit::<T>(prepacked_lhs_len, simd_align);
+        let (packed_lhs, _) = stack.make_aligned_uninit::<T>(packed_lhs_len, simd_align);
+        stack_packed_lhs = Some(Ptr(packed_lhs.as_mut_ptr() as *mut T));
+        (
+            rhs.as_mut_ptr() as *mut T,
+            prepacked_lhs.as_mut_ptr() as *mut T,
+        )
+    });
+    let pack_req = if stack_storage.is_some() {
+        None
+    } else {
+        pack_req
+    };
+
     #[cfg(feature = "std")]
     let mut mem = pack_req.map(PackBuffer::take);
     #[cfg(not(feature = "std"))]
@@ -564,7 +738,11 @@ pub unsafe fn gemm_basic_generic<
 
     #[cfg(not(feature = "std"))]
     let mut l2_slab = dyn_stack::MemBuffer::new(StackReq::new_aligned::<T>(
-        packed_lhs_stride * (mc / MR),
+        if stack_packed_lhs.is_some() {
+            0
+        } else {
+            packed_lhs_stride * (mc / MR)
+        },
         simd_align,
     ));
 
@@ -602,6 +780,7 @@ pub unsafe fn gemm_basic_generic<
                 storage.1.as_mut_ptr() as *mut T,
             )
         })
+        .or(stack_storage)
         .unwrap_or((core::ptr::null_mut(), core::ptr::null_mut()));
 
     let packed_rhs = Ptr(packed_rhs);
@@ -938,6 +1117,9 @@ pub unsafe fn gemm_basic_generic<
                         }
                     }
                 }
+            } else if let Some(packed_lhs) = stack_packed_lhs {
+                // the caller's stack: `Parallelism::None`, one thread
+                func(0, packed_lhs);
             } else {
                 #[cfg(feature = "std")]
                 let func = |tid: usize| {
@@ -1013,7 +1195,56 @@ macro_rules! __inject_mod {
                 conj_rhs: bool,
                 parallelism: $crate::Parallelism,
             ) {
-                $crate::gemm::gemm_basic_generic::<
+                gemm_basic_with_stack(
+                    m,
+                    n,
+                    k,
+                    dst,
+                    dst_cs,
+                    dst_rs,
+                    read_dst,
+                    lhs,
+                    lhs_cs,
+                    lhs_rs,
+                    rhs,
+                    rhs_cs,
+                    rhs_rs,
+                    alpha,
+                    beta,
+                    conj_dst,
+                    conj_lhs,
+                    conj_rhs,
+                    parallelism,
+                    None,
+                )
+            }
+
+            /// `gemm_basic`, with the packing buffers taken from `stack` when it is given and
+            /// `parallelism` is `Parallelism::None` (see `gemm_basic_generic_with_stack`).
+            #[inline(never)]
+            pub unsafe fn gemm_basic_with_stack(
+                m: usize,
+                n: usize,
+                k: usize,
+                dst: *mut $ty,
+                dst_cs: isize,
+                dst_rs: isize,
+                read_dst: bool,
+                lhs: *const $ty,
+                lhs_cs: isize,
+                lhs_rs: isize,
+                rhs: *const $ty,
+                rhs_cs: isize,
+                rhs_rs: isize,
+                alpha: $ty,
+                beta: $ty,
+                conj_dst: bool,
+                conj_lhs: bool,
+                conj_rhs: bool,
+                parallelism: $crate::Parallelism,
+                stack: Option<&mut $crate::dyn_stack::MemStack>,
+            ) {
+                $crate::gemm::gemm_basic_generic_with_stack::<
                     _,
                     $ty,
                     N,
@@ -1047,7 +1278,13 @@ macro_rules! __inject_mod {
                     &H_UKR,
                     $requires_packed_rhs,
                     parallelism,
+                    stack,
                 );
+            }
+
+            /// An upper bound on the stack `gemm_basic` takes for `Parallelism::None`.
+            pub fn gemm_scratch(m: usize, n: usize, k: usize) -> $crate::dyn_stack::StackReq {
+                $crate::gemm::gemm_scratch_generic::<$ty, { MR_DIV_N * N }, NR>(m, n, k)
             }
         }
     };
@@ -1084,8 +1321,57 @@ macro_rules! __inject_mod_cplx {
                     conj_lhs: bool,
                     conj_rhs: bool,
                     parallelism: $crate::Parallelism,
+                ) {
+                    gemm_basic_cplx_with_stack(
+                        m,
+                        n,
+                        k,
+                        dst,
+                        dst_cs,
+                        dst_rs,
+                        read_dst,
+                        lhs,
+                        lhs_cs,
+                        lhs_rs,
+                        rhs,
+                        rhs_cs,
+                        rhs_rs,
+                        alpha,
+                        beta,
+                        conj_dst,
+                        conj_lhs,
+                        conj_rhs,
+                        parallelism,
+                        None,
+                    )
+                }
+
+                /// `gemm_basic_cplx`, with the packing buffers taken from `stack` (see
+                /// `gemm_basic_generic_with_stack`).
+                #[inline(never)]
+                pub unsafe fn gemm_basic_cplx_with_stack(
+                    m: usize,
+                    n: usize,
+                    k: usize,
+                    dst: *mut num_complex::Complex<T>,
+                    dst_cs: isize,
+                    dst_rs: isize,
+                    read_dst: bool,
+                    lhs: *const num_complex::Complex<T>,
+                    lhs_cs: isize,
+                    lhs_rs: isize,
+                    rhs: *const num_complex::Complex<T>,
+                    rhs_cs: isize,
+                    rhs_rs: isize,
+                    alpha: num_complex::Complex<T>,
+                    beta: num_complex::Complex<T>,
+                    conj_dst: bool,
+                    conj_lhs: bool,
+                    conj_rhs: bool,
+                    parallelism: $crate::Parallelism,
+                    stack: Option<&mut $crate::dyn_stack::MemStack>,
                     ) {
-                    $crate::gemm::gemm_basic_generic::<_, _, N, { CPLX_MR_DIV_N * N }, CPLX_NR, CPLX_MR_DIV_N, H_CPLX_M, H_CPLX_N>(
+                    $crate::gemm::gemm_basic_generic_with_stack::<_, _, N, { CPLX_MR_DIV_N * N }, CPLX_NR, CPLX_MR_DIV_N, H_CPLX_M, H_CPLX_N>(
                         <$crate::simd::$simd as MixedSimd<T, T, T, T>>::try_new().unwrap(),
                         m,
                         n,
@@ -1110,7 +1396,13 @@ macro_rules! __inject_mod_cplx {
                         &H_CPLX_UKR,
                         false,
                         parallelism,
+                        stack,
                         );
+                }
+
+                /// An upper bound on the stack `gemm_basic_cplx` takes for `Parallelism::None`.
+                pub fn gemm_scratch(m: usize, n: usize, k: usize) -> $crate::dyn_stack::StackReq {
+                    $crate::gemm::gemm_scratch_generic::<num_complex::Complex<T>, { CPLX_MR_DIV_N * N }, CPLX_NR>(m, n, k)
                 }
             }
         }
@@ -1159,10 +1451,57 @@ macro_rules! __inject_sme_gate {
                 conj_rhs: bool,
                 parallelism: $crate::Parallelism,
             ) {
+                gemm_basic_with_stack(
+                    m,
+                    n,
+                    k,
+                    dst,
+                    dst_cs,
+                    dst_rs,
+                    read_dst,
+                    lhs,
+                    lhs_cs,
+                    lhs_rs,
+                    rhs,
+                    rhs_cs,
+                    rhs_rs,
+                    alpha,
+                    beta,
+                    conj_dst,
+                    conj_lhs,
+                    conj_rhs,
+                    parallelism,
+                    None,
+                )
+            }
+
+            #[inline(never)]
+            pub unsafe fn gemm_basic_with_stack(
+                m: usize,
+                n: usize,
+                k: usize,
+                dst: *mut $elem,
+                dst_cs: isize,
+                dst_rs: isize,
+                read_dst: bool,
+                lhs: *const $elem,
+                lhs_cs: isize,
+                lhs_rs: isize,
+                rhs: *const $elem,
+                rhs_cs: isize,
+                rhs_rs: isize,
+                alpha: $elem,
+                beta: $elem,
+                conj_dst: bool,
+                conj_lhs: bool,
+                conj_rhs: bool,
+                parallelism: $crate::Parallelism,
+                stack: Option<&mut $crate::dyn_stack::MemStack>,
+            ) {
                 // The two kernels take the same arguments; only the cost differs, and the
                 // table in `sme_thresholds` says which one wins for this shape.
                 if THRESHOLDS.wants_sme(m, n, k) {
-                    super::sme::gemm_basic(
+                    super::sme::gemm_basic_with_stack(
                         m,
                         n,
                         k,
@@ -1182,9 +1521,10 @@ macro_rules! __inject_sme_gate {
                         conj_lhs,
                         conj_rhs,
                         parallelism,
+                        stack,
                     )
                 } else {
-                    super::$fallback::gemm_basic(
+                    super::$fallback::gemm_basic_with_stack(
                         m,
                         n,
                         k,
@@ -1204,11 +1544,113 @@ macro_rules! __inject_sme_gate {
                         conj_lhs,
                         conj_rhs,
                         parallelism,
+                        stack,
                     )
                 }
             }
         }
     };
+}
+
+/// The kernel selection of `gemm_def!`: `$f` names the entry of each kernel module
+/// (`gemm_basic`, or `gemm_basic_with_stack`), so both function pointers pick the same kernel.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __select_gemm_fn {
+    ($f: ident, $sme_gate: ident) => {{
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            #[cfg(feature = "x86-v4")]
+            if $crate::feature_detected!("avx512f") {
+                return avx512f::$f;
+            }
+            if $crate::feature_detected!("fma") {
+                fma::$f
+            } else {
+                scalar::$f
+            }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            if $crate::feature_detected!("neon") {
+                // Apple Silicon only: `HasAppleSme` and the kernel itself are
+                // `target_vendor = "apple"` items, and other `aarch64` targets
+                // have no SME kernel to dispatch to.
+                #[cfg(all(
+                    target_arch = "aarch64",
+                    target_vendor = "apple",
+                    feature = "apple-sme"
+                ))]
+                if $crate::cache::HasAppleSme::$sme_gate() {
+                    return sme_gate::$f;
+                }
+                #[cfg(feature = "experimental-apple-amx")]
+                if $crate::cache::HasAmx::get() {
+                    return amx::$f;
+                }
+                neon::$f
+            } else {
+                scalar::$f
+            }
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            if $crate::feature_detected!("simd128") {
+                simd128::$f
+            } else {
+                scalar::$f
+            }
+        }
+
+        #[cfg(not(any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "wasm32",
+        )))]
+        {
+            scalar::$f
+        }
+    }};
+}
+
+/// The kernel selection of `gemm_cplx_def!`: `$f` names the entry of the `__inject_mod!`
+/// modules, `$fc` that of the `__inject_mod_cplx!` ones.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __select_gemm_cplx_fn {
+    ($f: ident, $fc: ident, $sme_gate: ident) => {{
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            #[cfg(feature = "x86-v4")]
+            if $crate::feature_detected!("avx512f") {
+                return avx512f_cplx::$fc;
+            }
+            if $crate::feature_detected!("fma") {
+                return fma_cplx::$fc;
+            }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Apple Silicon only, like the `f64`/`f32` kernels above.
+            #[cfg(all(
+                target_arch = "aarch64",
+                target_vendor = "apple",
+                feature = "apple-sme"
+            ))]
+            if $crate::cache::HasAppleSme::$sme_gate() {
+                return sme_gate::$f;
+            }
+            if $crate::feature_detected!("neon") && $crate::feature_detected!("fcma") {
+                return neonfcma::$f;
+            }
+        }
+
+        scalar_cplx::$fc
+    }};
 }
 
 #[macro_export]
@@ -1240,63 +1682,37 @@ macro_rules! gemm_def {
             $crate::Parallelism,
         );
 
+        type GemmWithStackTy = unsafe fn(
+            usize,
+            usize,
+            usize,
+            *mut T,
+            isize,
+            isize,
+            bool,
+            *const T,
+            isize,
+            isize,
+            *const T,
+            isize,
+            isize,
+            T,
+            T,
+            bool,
+            bool,
+            bool,
+            $crate::Parallelism,
+            Option<&mut $crate::dyn_stack::MemStack>,
+        );
+
         #[inline]
         fn init_gemm_fn() -> GemmTy {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            {
-                #[cfg(feature = "x86-v4")]
-                if $crate::feature_detected!("avx512f") {
-                    return avx512f::gemm_basic;
-                }
-                if $crate::feature_detected!("fma") {
-                    fma::gemm_basic
-                } else {
-                    scalar::gemm_basic
-                }
-            }
+            $crate::__select_gemm_fn!(gemm_basic, $sme_gate)
+        }
 
-            #[cfg(target_arch = "aarch64")]
-            {
-                if $crate::feature_detected!("neon") {
-                    // Apple Silicon only: `HasAppleSme` and the kernel itself are
-                    // `target_vendor = "apple"` items, and other `aarch64` targets
-                    // have no SME kernel to dispatch to.
-                    #[cfg(all(
-                        target_arch = "aarch64",
-                        target_vendor = "apple",
-                        feature = "apple-sme"
-                    ))]
-                    if $crate::cache::HasAppleSme::$sme_gate() {
-                        return sme_gate::gemm_basic;
-                    }
-                    #[cfg(feature = "experimental-apple-amx")]
-                    if $crate::cache::HasAmx::get() {
-                        return amx::gemm_basic;
-                    }
-                    neon::gemm_basic
-                } else {
-                    scalar::gemm_basic
-                }
-            }
-
-            #[cfg(target_arch = "wasm32")]
-            {
-                if $crate::feature_detected!("simd128") {
-                    simd128::gemm_basic
-                } else {
-                    scalar::gemm_basic
-                }
-            }
-
-            #[cfg(not(any(
-                target_arch = "x86",
-                target_arch = "x86_64",
-                target_arch = "aarch64",
-                target_arch = "wasm32",
-            )))]
-            {
-                scalar::gemm_basic
-            }
+        #[inline]
+        fn init_gemm_with_stack_fn() -> GemmWithStackTy {
+            $crate::__select_gemm_fn!(gemm_basic_with_stack, $sme_gate)
         }
 
         static GEMM_PTR: ::core::sync::atomic::AtomicPtr<()> =
@@ -1316,6 +1732,57 @@ macro_rules! gemm_def {
                 gemm_fn = init_gemm_ptr() as *mut ();
             }
             unsafe { ::core::mem::transmute(gemm_fn) }
+        }
+
+        static GEMM_WITH_STACK_PTR: ::core::sync::atomic::AtomicPtr<()> =
+            ::core::sync::atomic::AtomicPtr::new(::core::ptr::null_mut());
+
+        /// `get_gemm_fn`, for the entries that take a caller's stack: the same kernel.
+        #[inline(always)]
+        pub fn get_gemm_with_stack_fn() -> GemmWithStackTy {
+            let mut gemm_fn = GEMM_WITH_STACK_PTR.load(::core::sync::atomic::Ordering::Relaxed);
+            if gemm_fn.is_null() {
+                gemm_fn = init_gemm_with_stack_fn() as *mut ();
+                GEMM_WITH_STACK_PTR.store(gemm_fn, ::core::sync::atomic::Ordering::Relaxed);
+            }
+            unsafe { ::core::mem::transmute(gemm_fn) }
+        }
+
+        /// An upper bound on the stack `get_gemm_fn()` takes for an `m x n x k` product with
+        /// `Parallelism::None` and a caller's stack, whichever kernel it dispatches to and
+        /// whatever the strides: the largest bound of the kernels compiled for this target.
+        pub fn gemm_scratch(m: usize, n: usize, k: usize) -> $crate::dyn_stack::StackReq {
+            #[allow(unused_mut)]
+            let mut req = scalar::gemm_scratch(m, n, k);
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            {
+                req = req.or(fma::gemm_scratch(m, n, k));
+            }
+            #[cfg(all(feature = "x86-v4", any(target_arch = "x86", target_arch = "x86_64")))]
+            {
+                req = req.or(avx512f::gemm_scratch(m, n, k));
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                req = req.or(neon::gemm_scratch(m, n, k));
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                target_vendor = "apple",
+                feature = "apple-sme"
+            ))]
+            {
+                req = req.or(sme::gemm_scratch(m, n, k));
+            }
+            #[cfg(all(target_arch = "aarch64", feature = "experimental-apple-amx"))]
+            {
+                req = req.or(amx::gemm_scratch(m, n, k));
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                req = req.or(simd128::gemm_scratch(m, n, k));
+            }
+            req
         }
 
         $crate::__inject_mod!(scalar, $ty, 1, Scalar, false);
@@ -1370,35 +1837,39 @@ macro_rules! gemm_cplx_def {
             $crate::Parallelism,
         );
 
+        type GemmCplxWithStackTy = unsafe fn(
+            usize,
+            usize,
+            usize,
+            *mut num_complex::Complex<T>,
+            isize,
+            isize,
+            bool,
+            *const num_complex::Complex<T>,
+            isize,
+            isize,
+            *const num_complex::Complex<T>,
+            isize,
+            isize,
+            num_complex::Complex<T>,
+            num_complex::Complex<T>,
+            bool,
+            bool,
+            bool,
+            $crate::Parallelism,
+            Option<&mut $crate::dyn_stack::MemStack>,
+        );
+
         fn init_gemm_cplx_fn() -> GemmCplxTy {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            {
-                #[cfg(feature = "x86-v4")]
-                if $crate::feature_detected!("avx512f") {
-                    return avx512f_cplx::gemm_basic_cplx;
-                }
-                if $crate::feature_detected!("fma") {
-                    return fma_cplx::gemm_basic_cplx;
-                }
-            }
+            $crate::__select_gemm_cplx_fn!(gemm_basic, gemm_basic_cplx, $sme_gate)
+        }
 
-            #[cfg(target_arch = "aarch64")]
-            {
-                // Apple Silicon only, like the `f64`/`f32` kernels above.
-                #[cfg(all(
-                    target_arch = "aarch64",
-                    target_vendor = "apple",
-                    feature = "apple-sme"
-                ))]
-                if $crate::cache::HasAppleSme::$sme_gate() {
-                    return sme_gate::gemm_basic;
-                }
-                if $crate::feature_detected!("neon") && $crate::feature_detected!("fcma") {
-                    return neonfcma::gemm_basic;
-                }
-            }
-
-            scalar_cplx::gemm_basic_cplx
+        fn init_gemm_cplx_with_stack_fn() -> GemmCplxWithStackTy {
+            $crate::__select_gemm_cplx_fn!(
+                gemm_basic_with_stack,
+                gemm_basic_cplx_with_stack,
+                $sme_gate
+            )
         }
 
         static GEMM_PTR: ::core::sync::atomic::AtomicPtr<()> =
@@ -1418,6 +1889,49 @@ macro_rules! gemm_cplx_def {
                 gemm_fn = init_gemm_ptr() as *mut ();
             }
             unsafe { ::core::mem::transmute(gemm_fn) }
+        }
+
+        static GEMM_WITH_STACK_PTR: ::core::sync::atomic::AtomicPtr<()> =
+            ::core::sync::atomic::AtomicPtr::new(::core::ptr::null_mut());
+
+        /// `get_gemm_fn`, for the entries that take a caller's stack: the same kernel.
+        #[inline(always)]
+        pub fn get_gemm_with_stack_fn() -> GemmCplxWithStackTy {
+            let mut gemm_fn = GEMM_WITH_STACK_PTR.load(::core::sync::atomic::Ordering::Relaxed);
+            if gemm_fn.is_null() {
+                gemm_fn = init_gemm_cplx_with_stack_fn() as *mut ();
+                GEMM_WITH_STACK_PTR.store(gemm_fn, ::core::sync::atomic::Ordering::Relaxed);
+            }
+            unsafe { ::core::mem::transmute(gemm_fn) }
+        }
+
+        /// An upper bound on the stack `get_gemm_fn()` takes for an `m x n x k` product with
+        /// `Parallelism::None` and a caller's stack, whichever kernel it dispatches to and
+        /// whatever the strides: the largest bound of the kernels compiled for this target.
+        pub fn gemm_scratch(m: usize, n: usize, k: usize) -> $crate::dyn_stack::StackReq {
+            #[allow(unused_mut)]
+            let mut req = scalar_cplx::gemm_scratch(m, n, k);
+            #[cfg(target_arch = "aarch64")]
+            {
+                req = req.or(neonfcma::gemm_scratch(m, n, k));
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                target_vendor = "apple",
+                feature = "apple-sme"
+            ))]
+            {
+                req = req.or(sme::gemm_scratch(m, n, k));
+            }
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            {
+                req = req.or(fma_cplx::gemm_scratch(m, n, k));
+            }
+            #[cfg(all(feature = "x86-v4", any(target_arch = "x86", target_arch = "x86_64")))]
+            {
+                req = req.or(avx512f_cplx::gemm_scratch(m, n, k));
+            }
+            req
         }
 
         $crate::__inject_mod_cplx!(scalar, $ty, 1, Scalar);

@@ -38,6 +38,7 @@ pub mod simd;
 // aarch64 + Apple).
 pub mod sme_thresholds;
 
+pub use dyn_stack;
 pub use pulp;
 
 #[derive(Copy, Clone, Debug)]
