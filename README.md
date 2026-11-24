@@ -11,7 +11,7 @@ and public API as of `t4a-gemm-common` 0.20.4. `git diff 86102c5 HEAD` is the
 authority; code not listed here is upstream's. Upstream has no commits after
 `86102c5`, so the fork does not lag behind it.
 
-Three of the changes apply on every target, not only on Apple Silicon:
+Changes 1, 2, 3 and 5 apply on every target, not only on Apple Silicon:
 
 ### 1. A larger `kc` on every target
 
@@ -44,7 +44,7 @@ is large enough (`PACK_BUF` and `PackBuffer`, `gemm-common/src/gemm.rs:59-132`).
 - Why: tenferro-rs#2448 and #2472 measured two heap allocations per call for
   small factorization-sized products on `aarch64` (`gemm-f64/tests/alloc_count.rs`).
 - The packing request is bounded by the matrix: the column block is clamped to
-  `ceil(n / NR) * NR` (`gemm-common/src/gemm.rs:477-492`). Upstream (and this fork before
+  `ceil(n / NR) * NR` (`block_params`, `gemm-common/src/gemm.rs:288-325`). Upstream (and this fork before
   `#17`) takes `nc` from the L3-derived blocking, and on a host that reports no L3 (Apple,
   `cache.rs`) the serial path falls back to `128 * NR` columns whatever `n` is, so a
   `60 x 300` product asked for ~4 MB of packed `rhs` where ~0.6 MB is written. The number of
@@ -61,7 +61,7 @@ is large enough (`PACK_BUF` and `PackBuffer`, `gemm-common/src/gemm.rs:59-132`).
 
 Upstream allocates `mc / MR` flags per call, and again per worker thread. The
 fork allocates `ceil(min(m, mc) / MR)` and stores up to 64 inline
-(`DidPackLhs`, `gemm-common/src/gemm.rs:138-171`, used at `:609` and `:778`). No
+(`DidPackLhs`, `gemm-common/src/gemm.rs:135-175`, used at `:800` and `:968`). No
 arithmetic, packing decision or loop bound changes (commits `cb2d33c`, `71c9848`).
 
 - Why: a small `k` makes the cache-derived `mc` large (5461 zeroed flags per
@@ -99,7 +99,35 @@ measured on Apple (macOS 26, M5 Max).
 - Not promised: commit `5615de0` records a known gap on this path, about 20%
   slower at `n = 512..1024`, 6 threads, `k = 512`.
 
-### 5. Public API differences
+### 5. A caller-owned stack: `gemm_scratch` and `gemm_with_stack`
+
+`gemm::gemm_with_stack` is `gemm` with one more argument, a `dyn_stack::MemStack`.
+With `Parallelism::None` it takes the packed rhs, the prepacked lhs and the packed lhs
+block from that stack, and touches neither `PACK_BUF` nor `L2_SLAB`, so a call allocates
+nothing, a thread's first call and products larger than L2 included.
+`gemm::gemm_scratch::<T>(m, n, k, parallelism)` gives the stack it needs (#21).
+
+- The bound depends on `T`, `m`, `n`, `k` and the host's cache sizes, not on the strides. It
+  assumes the rhs is packed and the lhs both prepacked and packed, takes both orientations
+  (`gemm` transposes when `dst` is closer to row-major), and takes the largest bound of the
+  kernels compiled for the target, the SME and NEON blockings included. So it is loose: a
+  call uses one of the lhs buffers at most.
+- The two entries share one code path (`gemm_basic_generic_with_stack`, with `None` for
+  `gemm`), so `gemm_with_stack` gives bit-for-bit `gemm`'s result: the kernel, the blocking
+  and the packing are the same, only where the packed operands live differs.
+- `Parallelism::Rayon`: `gemm_with_stack` is `gemm`, with the thread-local buffers of every
+  worker, and `gemm_scratch` is empty. `f16` is not supported (its kernels allocate their own
+  buffers), and both functions panic for it.
+- Why: colmat-next-rs's matrix product promises "allocates nothing beyond the stack you pass,
+  from the first call" (tensor4all/colmat-next-rs#23), and runs its own threads with one
+  `Parallelism::None` call per participant.
+- Tests: `gemm/tests/with_stack.rs`. A first call on a fresh thread allocates nothing, for the
+  four types, on shapes on both sides of the L2 size, of the SME gate and of the small-product
+  blocking; and random shapes and layouts give bit-for-bit `gemm`'s result on a stack of
+  exactly `gemm_scratch`. The process-wide one-time set-up (cache sizes, kernel selection, the
+  SME probe) is done before the counted call.
+
+### 6. Public API differences
 
 - Crate names are `t4a-gemm`, `t4a-gemm-common`, `t4a-gemm-f16`, `-f32`,
   `-f64`, `-c32` and `-c64`, at 0.20.x; the library names are upstream's
@@ -114,13 +142,18 @@ measured on Apple (macOS 26, M5 Max).
   `gemm_common::cache::HasAppleSme` (Apple `aarch64` with `apple-sme` only).
 - `gemm_c32::microkernel` and `gemm_c64::microkernel` are `pub`; upstream keeps
   them private (`f32`/`f64` were already `pub`).
+- `gemm::gemm_scratch` and `gemm::gemm_with_stack` (change 5); in `gemm-common`,
+  `gemm::gemm_basic_generic_with_stack`, `gemm::gemm_scratch_generic` and the re-export of
+  `dyn_stack`; in each `gemm_def!`/`gemm_cplx_def!` module, `get_gemm_with_stack_fn` and
+  `gemm_scratch` next to `get_gemm_fn`, whose type is unchanged.
 
 The benchmark harness (`gemm/benches/bench.rs`) is unchanged from upstream.
 
 ### Which kernel a call takes
 
-The order of the checks in `init_gemm_fn` (`gemm-common/src/gemm.rs:1233-1288`,
-`f32`/`f64`) and `init_gemm_cplx_fn` (`:1362-1390`, `c32`/`c64`). Only the two
+The order of the checks in `__select_gemm_fn!` (`gemm-common/src/gemm.rs:1559`,
+`f32`/`f64`) and `__select_gemm_cplx_fn!` (`:1623`, `c32`/`c64`), which pick the kernel
+for both `get_gemm_fn` and `get_gemm_with_stack_fn`. Only the two
 Apple SME rows are the fork's; the rest is upstream's dispatch.
 
 | Target | `f32`, `f64` | `c32`, `c64` |
@@ -141,7 +174,8 @@ differs there.
 - Results bitwise identical to upstream's (change 1 regroups the `k` sum).
 - The measured speed-ups anywhere but the Apple M5 Max they were measured on.
 - SME on any target other than Apple `aarch64` with macOS 26 or newer.
-- Zero allocation beyond the shapes `alloc_count.rs` checks.
+- Zero allocation from `gemm` beyond the shapes `alloc_count.rs` checks; `gemm_with_stack`
+  with `Parallelism::None` is the entry that allocates nothing (change 5).
 
 ### Verified hosts
 
