@@ -43,7 +43,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev pkg-config
 
       - name: Collect coverage data
-        run: cargo llvm-cov nextest --lcov --output-path lcov.info --package t4a-gemm
+        run: cargo llvm-cov nextest --cargo-profile ci --lcov --output-path lcov.info --package t4a-gemm
 
       - name: Upload coverage data to codecov
         uses: codecov/codecov-action@v3
