@@ -16,7 +16,8 @@ half = { version = "2.3", default-features = false, features = ["num-traits", "b
 
 # No default profile carries debug info (tensor4all-agent-rules, rules/rust/performance.md,
 # "Build Profiles And Target Hygiene"): `debug = 0`, not the `debug = true` inherited from upstream
-# `gemm`. `CARGO_PROFILE_DEV_DEBUG=true` brings it back for a debugger session.
+# `gemm`. For a debugger session, `CARGO_PROFILE_DEV_DEBUG=true` brings it back for `cargo build`
+# and `CARGO_PROFILE_TEST_DEBUG=true` for `cargo test` (`[profile.test]` below pins its own `debug`).
 [profile.dev]
 opt-level = 3
 debug = 0
