@@ -14,9 +14,12 @@ num-complex = { version = "0.4", default-features = false }
 rayon = "1"
 half = { version = "2.3", default-features = false, features = ["num-traits", "bytemuck"] }
 
+# No default profile carries debug info (tensor4all-agent-rules, rules/rust/performance.md,
+# "Build Profiles And Target Hygiene"): `debug = 0`, not the `debug = true` inherited from upstream
+# `gemm`. `CARGO_PROFILE_DEV_DEBUG=true` brings it back for a debugger session.
 [profile.dev]
 opt-level = 3
-debug = true
+debug = 0
 debug-assertions = true
 overflow-checks = true
 lto = false
@@ -25,15 +28,16 @@ incremental = true
 codegen-units = 256
 rpath = false
 
+[profile.test]
+debug = 0
+
 # CI builds and tests with this profile (tensor4all-agent-rules, rules/common/repository.md,
 # "Build Profiles"). It inherits `test`, not `release`: `test` inherits `dev` above, which keeps
 # `opt-level = 3` and turns `debug-assertions` and `overflow-checks` on deliberately. The
 # micro-kernels are raw-pointer code (several hundred `unsafe` sites) whose stride and packing
 # invariants are `debug_assert!`s, and the standard library's unsafe-precondition checks only run
-# with `debug-assertions`; a release-inherited CI would test none of that. `debug = 0` overrides the
-# `debug = true` of `dev`, which is the debug info this profile exists to drop.
+# with `debug-assertions`; a release-inherited CI would test none of that.
 [profile.ci]
 inherits = "test"
-debug = 0
 incremental = false
 strip = "symbols"
