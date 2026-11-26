@@ -301,3 +301,143 @@ pub unsafe fn pack_rhs<T: Copy, const N: usize, const NR: usize, S: Simd>(
         || pack_generic::<T, N, NR>(n, k, dst, src, src_rs, src_cs, dst_stride),
     );
 }
+
+#[doc(hidden)]
+pub trait PackOperand<T>: Copy + Send + Sync + 'static {
+    unsafe fn pack_lhs<S: Simd, const N: usize, const MR: usize>(
+        simd: S,
+        m: usize,
+        k: usize,
+        dst: crate::Ptr<T>,
+        src: crate::Ptr<Self>,
+        src_cs: isize,
+        src_rs: isize,
+        dst_stride: usize,
+    );
+
+    unsafe fn pack_rhs<S: Simd, const N: usize, const NR: usize>(
+        simd: S,
+        n: usize,
+        k: usize,
+        dst: crate::Ptr<T>,
+        src: crate::Ptr<Self>,
+        src_cs: isize,
+        src_rs: isize,
+        dst_stride: usize,
+    );
+}
+
+impl<T: Copy + Send + Sync + 'static> PackOperand<T> for T {
+    #[inline(always)]
+    unsafe fn pack_lhs<S: Simd, const N: usize, const MR: usize>(
+        simd: S,
+        m: usize,
+        k: usize,
+        dst: crate::Ptr<T>,
+        src: crate::Ptr<Self>,
+        src_cs: isize,
+        src_rs: isize,
+        dst_stride: usize,
+    ) {
+        unsafe { self::pack_lhs::<T, N, MR, S>(simd, m, k, dst, src, src_cs, src_rs, dst_stride) }
+    }
+
+    #[inline(always)]
+    unsafe fn pack_rhs<S: Simd, const N: usize, const NR: usize>(
+        simd: S,
+        n: usize,
+        k: usize,
+        dst: crate::Ptr<T>,
+        src: crate::Ptr<Self>,
+        src_cs: isize,
+        src_rs: isize,
+        dst_stride: usize,
+    ) {
+        unsafe { self::pack_rhs::<T, N, NR, S>(simd, n, k, dst, src, src_cs, src_rs, dst_stride) }
+    }
+}
+
+#[inline(always)]
+unsafe fn pack_convert_inner_loop<Src: Copy + Into<T>, T: Copy, const DST_WIDTH: usize>(
+    mut dst: *mut T,
+    mut src: *const Src,
+    src_rs: isize,
+    src_cs: isize,
+    src_width: usize,
+    k: usize,
+) {
+    for _ in 0..k {
+        for j in 0..src_width {
+            *dst.add(j) = (*src.offset(j as isize * src_rs)).into();
+        }
+        quick_zero::<T>(core::slice::from_raw_parts_mut(
+            dst.add(src_width) as _,
+            DST_WIDTH - src_width,
+        ));
+        src = src.wrapping_offset(src_cs);
+        dst = dst.add(DST_WIDTH);
+    }
+}
+
+#[inline(always)]
+unsafe fn pack_convert<Src: Copy + Into<T>, T: Copy, const DST_WIDTH: usize>(
+    m: usize,
+    k: usize,
+    mut dst: *mut T,
+    mut src: *const Src,
+    src_cs: isize,
+    src_rs: isize,
+    dst_stride: usize,
+) {
+    let m_width = m / DST_WIDTH * DST_WIDTH;
+    let mut i = 0;
+    while i < m_width {
+        pack_convert_inner_loop::<Src, T, DST_WIDTH>(dst, src, src_rs, src_cs, DST_WIDTH, k);
+        src = src.wrapping_offset(src_rs * DST_WIDTH as isize);
+        dst = dst.add(dst_stride);
+        i += DST_WIDTH;
+    }
+    if i < m {
+        pack_convert_inner_loop::<Src, T, DST_WIDTH>(dst, src, src_rs, src_cs, m - i, k);
+    }
+}
+
+impl PackOperand<f64> for f32 {
+    #[inline(never)]
+    unsafe fn pack_lhs<S: Simd, const N: usize, const MR: usize>(
+        _: S,
+        m: usize,
+        k: usize,
+        dst: crate::Ptr<f64>,
+        src: crate::Ptr<Self>,
+        src_cs: isize,
+        src_rs: isize,
+        dst_stride: usize,
+    ) {
+        let dst = dst.0;
+        let src = src.0;
+        S::vectorize(
+            #[inline(always)]
+            || pack_convert::<Self, f64, MR>(m, k, dst, src, src_cs, src_rs, dst_stride),
+        );
+    }
+
+    #[inline(never)]
+    unsafe fn pack_rhs<S: Simd, const N: usize, const NR: usize>(
+        _: S,
+        n: usize,
+        k: usize,
+        dst: crate::Ptr<f64>,
+        src: crate::Ptr<Self>,
+        src_cs: isize,
+        src_rs: isize,
+        dst_stride: usize,
+    ) {
+        let dst = dst.0;
+        let src = src.0;
+        S::vectorize(
+            #[inline(always)]
+            || pack_convert::<Self, f64, NR>(n, k, dst, src, src_rs, src_cs, dst_stride),
+        );
+    }
+}

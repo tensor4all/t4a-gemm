@@ -5,7 +5,10 @@ mod gemm;
 
 #[cfg(feature = "f16")]
 pub use crate::gemm::f16;
-pub use crate::gemm::{c32, c64, gemm, gemm_scratch, gemm_with_stack};
+pub use crate::gemm::{
+    c32, c64, gemm, gemm_mixed, gemm_mixed_scratch, gemm_mixed_with_stack, gemm_scratch,
+    gemm_with_stack, MixedRealGemmToF64,
+};
 /// The `dyn-stack` version of [`gemm_with_stack`]'s `stack` and [`gemm_scratch`]'s result.
 pub use gemm_common::dyn_stack;
 pub use gemm_common::Parallelism;
@@ -26,6 +29,37 @@ mod tests {
     use alloc::{vec, vec::Vec};
     #[cfg(feature = "f16")]
     use num_traits::Float;
+
+    #[test]
+    fn unsupported_mixed_pair_is_rejected_before_output() {
+        let lhs = [1.0_f64];
+        let rhs = [2.0_f32];
+        let mut dst = [-777.0_f64];
+        let before = dst[0].to_bits();
+        let result = unsafe {
+            crate::gemm::gemm_mixed_imp(
+                1,
+                1,
+                1,
+                dst.as_mut_ptr(),
+                1,
+                1,
+                false,
+                lhs.as_ptr(),
+                1,
+                1,
+                rhs.as_ptr(),
+                1,
+                1,
+                0.0,
+                1.0,
+                Parallelism::None,
+                None,
+            )
+        };
+        assert!(result.is_err());
+        assert_eq!(dst[0].to_bits(), before);
+    }
 
     // The `f16` element type (and its `from_f32`) only exists with the `f16`
     // feature, so the test must not be compiled without it.
