@@ -383,7 +383,8 @@ pub unsafe fn gemm_basic_generic<
         + core::ops::Add<Output = T>
         + core::ops::Mul<Output = T>
         + core::cmp::PartialEq
-        + 'static,
+        + 'static
+        + PackOperand<T>,
     const N: usize,
     const MR: usize,
     const NR: usize,
@@ -470,7 +471,8 @@ pub unsafe fn gemm_basic_generic_with_stack<
         + core::ops::Add<Output = T>
         + core::ops::Mul<Output = T>
         + core::cmp::PartialEq
-        + 'static,
+        + 'static
+        + PackOperand<T>,
     const N: usize,
     const MR: usize,
     const NR: usize,
@@ -680,7 +682,8 @@ pub unsafe fn gemm_blocked_generic_with_stack<
         + core::ops::Add<Output = T>
         + core::ops::Mul<Output = T>
         + core::cmp::PartialEq
-        + 'static,
+        + 'static
+        + PackOperand<T>,
     const N: usize,
     const MR: usize,
     const NR: usize,

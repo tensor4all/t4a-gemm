@@ -27,6 +27,18 @@ mod mixed_sealed {
 /// accepts_supported_pair::<(f32, f32)>();
 /// accepts_supported_pair::<(f32, f64)>();
 /// ```
+///
+/// An unsupported pair fails during type checking and reports the supported alternatives:
+///
+/// ```compile_fail
+/// use gemm::MixedRealGemmToF64;
+/// fn accepts_supported_pair<T: MixedRealGemmToF64>() {}
+/// accepts_supported_pair::<(f64, f32)>();
+/// ```
+#[diagnostic::on_unimplemented(
+    message = "unsupported mixed GEMM operand pair",
+    note = "supported pairs are `f32 × f32 → f64` and `f32 × f64 → f64`; see `gemm_mixed` documentation"
+)]
 pub trait MixedRealGemmToF64: mixed_sealed::Sealed + Copy + Send + Sync + 'static {}
 impl MixedRealGemmToF64 for (f32, f32) {}
 impl MixedRealGemmToF64 for (f32, f64) {}

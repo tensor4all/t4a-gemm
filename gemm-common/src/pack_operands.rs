@@ -304,7 +304,12 @@ pub unsafe fn pack_rhs<T: Copy, const N: usize, const NR: usize, S: Simd>(
 
 mod pack_sealed {
     pub trait Sealed {}
-    impl<T> Sealed for T {}
+    impl Sealed for f32 {}
+    impl Sealed for f64 {}
+    impl Sealed for crate::gemm::c32 {}
+    impl Sealed for crate::gemm::c64 {}
+    #[cfg(feature = "f16")]
+    impl Sealed for half::f16 {}
 }
 
 #[doc(hidden)]
@@ -338,35 +343,53 @@ pub trait PackOperand<T>: pack_sealed::Sealed + Copy + Send + Sync + 'static {
     );
 }
 
-impl<T: Copy + Send + Sync + 'static> PackOperand<T> for T {
-    #[inline(always)]
-    unsafe fn pack_lhs<S: Simd, const N: usize, const MR: usize>(
-        simd: S,
-        m: usize,
-        k: usize,
-        dst: crate::Ptr<T>,
-        src: crate::Ptr<Self>,
-        src_cs: isize,
-        src_rs: isize,
-        dst_stride: usize,
-    ) {
-        unsafe { self::pack_lhs::<T, N, MR, S>(simd, m, k, dst, src, src_cs, src_rs, dst_stride) }
-    }
+macro_rules! impl_pack_operand_identity {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl PackOperand<$ty> for $ty {
+                #[inline(always)]
+                unsafe fn pack_lhs<S: Simd, const N: usize, const MR: usize>(
+                    simd: S,
+                    m: usize,
+                    k: usize,
+                    dst: crate::Ptr<$ty>,
+                    src: crate::Ptr<Self>,
+                    src_cs: isize,
+                    src_rs: isize,
+                    dst_stride: usize,
+                ) {
+                    unsafe {
+                        self::pack_lhs::<$ty, N, MR, S>(
+                            simd, m, k, dst, src, src_cs, src_rs, dst_stride,
+                        )
+                    }
+                }
 
-    #[inline(always)]
-    unsafe fn pack_rhs<S: Simd, const N: usize, const NR: usize>(
-        simd: S,
-        n: usize,
-        k: usize,
-        dst: crate::Ptr<T>,
-        src: crate::Ptr<Self>,
-        src_cs: isize,
-        src_rs: isize,
-        dst_stride: usize,
-    ) {
-        unsafe { self::pack_rhs::<T, N, NR, S>(simd, n, k, dst, src, src_cs, src_rs, dst_stride) }
-    }
+                #[inline(always)]
+                unsafe fn pack_rhs<S: Simd, const N: usize, const NR: usize>(
+                    simd: S,
+                    n: usize,
+                    k: usize,
+                    dst: crate::Ptr<$ty>,
+                    src: crate::Ptr<Self>,
+                    src_cs: isize,
+                    src_rs: isize,
+                    dst_stride: usize,
+                ) {
+                    unsafe {
+                        self::pack_rhs::<$ty, N, NR, S>(
+                            simd, n, k, dst, src, src_cs, src_rs, dst_stride,
+                        )
+                    }
+                }
+            }
+        )*
+    };
 }
+
+impl_pack_operand_identity!(f32, f64, crate::gemm::c32, crate::gemm::c64);
+#[cfg(feature = "f16")]
+impl_pack_operand_identity!(half::f16);
 
 #[inline(always)]
 unsafe fn pack_convert_inner_loop<Src: Copy + Into<T>, T: Copy, const DST_WIDTH: usize>(

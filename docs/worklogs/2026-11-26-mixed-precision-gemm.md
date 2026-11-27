@@ -12,10 +12,12 @@
 - Mixed calls bypass homogeneous GEMV, horizontal and other early routes. The low-level facade keeps
   `dst := alpha * dst + beta * lhs * rhs`, handles zero depth and negative strides, and does not swap
   `f32 × f64` into an unsupported transposed pair. Scratch and the optional caller stack are sized in
-  packed `f64` elements. `PackOperand` is sealed so downstream users cannot add custom packing
-  implementations. Allocation wording distinguishes one-time process-wide kernel/cache
-  initialization from per-call working memory; only the latter is promised to be zero with a
-  caller-provided stack after initialization.
+  packed `f64` elements. `PackOperand` is sealed to the intended scalar set (`f32`, `f64`, `c32`,
+  `c64`, and feature-gated `f16`), with no blanket identity implementation for arbitrary `Copy`
+  types. The public allowance trait's `diagnostic::on_unimplemented` message names the two supported
+  pairs and has a compile-fail example. Allocation wording distinguishes one-time process-wide
+  kernel/cache initialization from per-call working memory; only the latter is promised to be zero
+  with a caller-provided stack after initialization.
 - The internal dynamic dispatcher returns `UnsupportedMixedGemm` before shape handling or any
   destination access. The sealed public wrappers reject unsupported pairs at compile time instead.
   A short caller stack also panics before output mutation for `Parallelism::None`; with Rayon, the
@@ -44,9 +46,9 @@ source was edited.
 - Existing caller-stack tests remain bit-for-bit unchanged, and the new public rustdoc examples run.
 - The full workspace suite passes after the review updates, and passes again after the final
   packer/facade lint corrections and review-coverage additions: 6 facade unit tests including
-  dynamic rejection, 9 mixed integration tests, 3 caller-stack tests, and 4 rustdoc examples. The
-  `x86-v4` mixed suite also passes all 9 tests. The no-default-features workspace build passes as
-  well.
+  dynamic rejection, 9 mixed integration tests, 3 caller-stack tests, and 5 rustdoc examples
+  (including the unsupported-pair compile-fail example). The `x86-v4` mixed suite also passes all 9
+  tests. The no-default-features workspace build passes as well.
 - Rustdoc builds with warnings denied. `cargo fmt --all -- --check` still reports only the inherited
   formatting differences in `gemm-common/src/sme_thresholds.rs` and
   `gemm-f64/examples/did_pack_sizing.rs`. Workspace clippy with warnings denied still fails on
