@@ -551,8 +551,10 @@ where
 }
 
 /// [`gemm_mixed`], with packed `f64` storage taken from `stack` for `Parallelism::None`.
-/// With a stack sized by [`gemm_mixed_scratch`], the call allocates nothing, including its first
-/// call on a fresh thread. The arithmetic and blocking are the same as [`gemm_mixed`].
+/// With a stack sized by [`gemm_mixed_scratch`], the call allocates no per-call working memory
+/// after process-wide kernel and cache initialization. The first mixed call may allocate for that
+/// initialization; supplying a stack does not suppress it. The arithmetic and blocking are the same
+/// as [`gemm_mixed`].
 ///
 /// # Safety
 ///
@@ -561,8 +563,9 @@ where
 ///
 /// # Panics
 ///
-/// A short stack panics before any destination write. The length is checked when each buffer is
-/// acquired, not by an up-front comparison with [`gemm_mixed_scratch`].
+/// With `Parallelism::None`, a short stack panics before any destination write. The length is
+/// checked when each buffer is acquired, not by an up-front comparison with
+/// [`gemm_mixed_scratch`]. With `Parallelism::Rayon`, `stack` is ignored and this does not apply.
 ///
 /// # Examples
 ///

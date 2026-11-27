@@ -93,6 +93,14 @@ impl Layout {
         row_major: true,
         ..Self::COL
     };
+    const REVERSE_ROWS: Self = Self {
+        reverse_rows: true,
+        ..Self::COL
+    };
+    const REVERSE_COLS: Self = Self {
+        reverse_cols: true,
+        ..Self::COL
+    };
     const REVERSED_PADDED: Self = Self {
         row_major: false,
         pad: 3,
@@ -250,6 +258,7 @@ fn check_case<Lhs: Scalar, Rhs: Scalar>(
     k: usize,
     layouts: (Layout, Layout, Layout),
     read_dst: bool,
+    alpha: f64,
     parallelism: Parallelism,
 ) where
     (Lhs, Rhs): MixedRealGemmToF64,
@@ -265,7 +274,6 @@ fn check_case<Lhs: Scalar, Rhs: Scalar>(
     let before = dst.clone();
     let lhs = View::<Lhs>::new(m, k, lhs_layout, |i, j| value(i, j, 5));
     let rhs = View::<Rhs>::new(k, n, rhs_layout, |i, j| value(i, j, 7));
-    let alpha = if read_dst { 0.75 } else { 0.0 };
     let beta = 1.25;
 
     unsafe {
@@ -305,7 +313,7 @@ fn check_case<Lhs: Scalar, Rhs: Scalar>(
             let tolerance = 256.0 * k.max(1) as f64 * f64::EPSILON * scale.max(1.0);
             assert!(
                 (got - want).abs() <= tolerance,
-                "{} x {} x {} at ({i}, {j}), layouts {layouts:?}, read_dst={read_dst}, {parallelism:?}: got={got:e}, want={want:e}, error={:e}, tolerance={tolerance:e}",
+                "{} x {} x {} at ({i}, {j}), layouts {layouts:?}, read_dst={read_dst}, alpha={alpha}, beta={beta}, {parallelism:?}: got={got:e}, want={want:e}, error={:e}, tolerance={tolerance:e}",
                 m,
                 n,
                 k,
@@ -324,6 +332,9 @@ where
         (Layout::COL, Layout::COL, Layout::COL),
         (Layout::ROW, Layout::COL, Layout::ROW),
         (Layout::COL, Layout::ROW, Layout::COL),
+        (Layout::REVERSE_ROWS, Layout::COL, Layout::COL),
+        (Layout::COL, Layout::COL, Layout::REVERSE_COLS),
+        (Layout::COL, Layout::REVERSE_COLS, Layout::COL),
         (
             Layout::REVERSED_PADDED,
             Layout::REVERSED_PADDED,
@@ -342,8 +353,14 @@ where
         (7, 5, 1031),
     ] {
         for &layout in &layouts {
-            for read_dst in [false, true] {
-                check_case::<Lhs, Rhs>(m, n, k, layout, read_dst, parallelism);
+            for &(read_dst, alpha) in &[
+                (false, 0.0),
+                (false, 0.75),
+                (true, 0.0),
+                (true, 0.75),
+                (true, 1.0),
+            ] {
+                check_case::<Lhs, Rhs>(m, n, k, layout, read_dst, alpha, parallelism);
             }
         }
     }
@@ -552,13 +569,44 @@ where
     }
 }
 
+#[cfg(feature = "rayon")]
+#[test]
+fn rayon_ignores_the_caller_stack() {
+    let lhs = [2.0_f32];
+    let rhs = [3.0_f32];
+    let mut dst = [1.0_f64];
+    let mut empty = MemBuffer::new(StackReq::EMPTY);
+    unsafe {
+        gemm_mixed_with_stack(
+            1,
+            1,
+            1,
+            dst.as_mut_ptr(),
+            1,
+            1,
+            true,
+            lhs.as_ptr(),
+            1,
+            1,
+            rhs.as_ptr(),
+            1,
+            1,
+            0.5,
+            2.0,
+            Parallelism::Rayon(2),
+            MemStack::new(&mut empty),
+        );
+    }
+    assert_eq!(dst[0], 12.5);
+}
+
 #[test]
 fn caller_stack_matches_and_a_short_stack_is_atomic() {
     check_stack_pair::<f32, f32>();
     check_stack_pair::<f32, f64>();
 }
 
-fn assert_first_call_allocates_nothing<Lhs: Scalar, Rhs: Scalar>()
+fn assert_no_per_call_allocation_after_initialization<Lhs: Scalar, Rhs: Scalar>()
 where
     (Lhs, Rhs): MixedRealGemmToF64,
 {
@@ -593,7 +641,10 @@ where
                 let with_control = ALLOCS.load(Ordering::Relaxed) - before;
                 COUNTED.with(|c| c.set(false));
                 assert_eq!(with_control, allocations + 1, "allocator positive control");
-                assert_eq!(allocations, 0, "first caller-stack call allocated");
+                assert_eq!(
+                    allocations, 0,
+                    "caller-stack call allocated after initialization"
+                );
             })
             .join()
             .unwrap();
@@ -601,9 +652,10 @@ where
 }
 
 #[test]
-fn first_caller_stack_call_allocates_nothing() {
+fn caller_stack_calls_allocate_no_per_call_memory_after_initialization() {
+    // Complete process-wide kernel/cache initialization before measuring per-call allocations.
     check_pair::<f32, f32>(Parallelism::None);
     check_pair::<f32, f64>(Parallelism::None);
-    assert_first_call_allocates_nothing::<f32, f32>();
-    assert_first_call_allocates_nothing::<f32, f64>();
+    assert_no_per_call_allocation_after_initialization::<f32, f32>();
+    assert_no_per_call_allocation_after_initialization::<f32, f64>();
 }

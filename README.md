@@ -179,9 +179,11 @@ destination access; the public sealed API rejects one at compile time. No whole-
 copy or per-pair microkernel is added, and no performance claim is made.
 
 `gemm_mixed_scratch` and `gemm_mixed_with_stack` provide the corresponding caller-owned `f64`
-packing storage contract. A short stack panics before destination mutation. The destination and
-inputs may have row-major, column-major, padded or reversed strides; mixed dispatch does not swap
-`f32 x f64` into an unsupported `f64 x f32` transpose.
+packing storage contract. With `Parallelism::None`, a short stack panics before destination mutation;
+with Rayon, the supplied stack is ignored. After process-wide kernel/cache initialization, a
+caller-stack call allocates no per-call working memory; the first mixed call may perform that
+initialization. The destination and inputs may have row-major, column-major, padded or reversed
+strides; mixed dispatch does not swap `f32 x f64` into an unsupported `f64 x f32` transpose.
 
 ### Which kernel a call takes
 

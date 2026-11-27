@@ -302,8 +302,13 @@ pub unsafe fn pack_rhs<T: Copy, const N: usize, const NR: usize, S: Simd>(
     );
 }
 
+mod pack_sealed {
+    pub trait Sealed {}
+    impl<T> Sealed for T {}
+}
+
 #[doc(hidden)]
-pub trait PackOperand<T>: Copy + Send + Sync + 'static {
+pub trait PackOperand<T>: pack_sealed::Sealed + Copy + Send + Sync + 'static {
     // INVARIANT: this is the existing packer ABI; identity and converting packers must share
     // the same argument order so the blocked driver makes no per-call dispatch decision.
     #[allow(clippy::too_many_arguments)]
@@ -441,6 +446,8 @@ impl PackOperand<f64> for f32 {
     ) {
         let dst = dst.0;
         let src = src.0;
+        // Match the homogeneous RHS orientation: depth advances by the original `src_rs`,
+        // while each packed N-wide row advances by the original `src_cs`.
         S::vectorize(
             #[inline(always)]
             || pack_convert::<Self, f64, NR>(n, k, dst, src, src_rs, src_cs, dst_stride),
