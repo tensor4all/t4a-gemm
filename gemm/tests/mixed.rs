@@ -179,6 +179,9 @@ impl<T: Scalar> View<T> {
     }
 }
 
+// INVARIANT: the helper mirrors the low-level GEMM argument list so every test case uses
+// identical pointer, stride, scalar, and scratch semantics.
+#[allow(clippy::too_many_arguments)]
 unsafe fn call<Lhs: Scalar, Rhs: Scalar>(
     m: usize,
     n: usize,

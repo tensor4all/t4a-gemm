@@ -673,7 +673,7 @@ pub(crate) unsafe fn gemm_mixed_imp<Lhs: 'static, Rhs: 'static>(
             for j in 0..n {
                 for i in 0..m {
                     let dst = dst.wrapping_offset(i as isize * dst_rs + j as isize * dst_cs);
-                    *dst = alpha * *dst;
+                    *dst *= alpha;
                 }
             }
         }
@@ -728,17 +728,19 @@ pub(crate) unsafe fn gemm_mixed_imp<Lhs: 'static, Rhs: 'static>(
     }
 
     if rhs_is_f32 {
-        Ok(dispatch!(
+        dispatch!(
             f32,
             f32,
             gemm_f64::gemm::f64::mixed::get_f32_f32_with_stack_fn
-        ))
+        );
+        Ok(())
     } else {
-        Ok(dispatch!(
+        dispatch!(
             f32,
             f64,
             gemm_f64::gemm::f64::mixed::get_f32_f64_with_stack_fn
-        ))
+        );
+        Ok(())
     }
 }
 

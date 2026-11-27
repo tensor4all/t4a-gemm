@@ -304,6 +304,9 @@ pub unsafe fn pack_rhs<T: Copy, const N: usize, const NR: usize, S: Simd>(
 
 #[doc(hidden)]
 pub trait PackOperand<T>: Copy + Send + Sync + 'static {
+    // INVARIANT: this is the existing packer ABI; identity and converting packers must share
+    // the same argument order so the blocked driver makes no per-call dispatch decision.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn pack_lhs<S: Simd, const N: usize, const MR: usize>(
         simd: S,
         m: usize,
@@ -315,6 +318,9 @@ pub trait PackOperand<T>: Copy + Send + Sync + 'static {
         dst_stride: usize,
     );
 
+    // INVARIANT: this is the existing packer ABI; identity and converting packers must share
+    // the same argument order so the blocked driver makes no per-call dispatch decision.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn pack_rhs<S: Simd, const N: usize, const NR: usize>(
         simd: S,
         n: usize,

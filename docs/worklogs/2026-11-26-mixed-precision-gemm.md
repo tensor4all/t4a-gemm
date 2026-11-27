@@ -36,9 +36,14 @@ source was edited.
   `f32::MAX`, in both supported pairs. Their products are finite and nonzero in `f64`.
 - The internal unsupported-pair test returns an error and leaves the destination bitwise unchanged.
 - Existing caller-stack tests remain bit-for-bit unchanged, and the new public rustdoc examples run.
-- The full workspace suite passes after the review updates. The no-default-features workspace build
-  also passes; its remaining `fma` cfg and `f16` unused-mut warnings are inherited from unchanged
-  code. The corresponding warning introduced by the mixed selector is locally suppressed with its
-  no-std dispatch rationale.
+- The full workspace suite passes after the review updates, and passes again after the final
+  packer/facade lint corrections: 6 facade unit tests including dynamic rejection, 8 mixed
+  integration tests, 3 caller-stack tests, and 4 rustdoc examples. The `x86-v4` mixed suite also
+  passes all 8 tests. The no-default-features workspace build passes as well.
+- Rustdoc builds with warnings denied. `cargo fmt --all -- --check` still reports only the inherited
+  formatting differences in `gemm-common/src/sme_thresholds.rs` and
+  `gemm-f64/examples/did_pack_sizing.rs`. Workspace clippy with warnings denied still fails on
+  unchanged upstream diagnostics; the new packer/facade/test diagnostics were corrected, and a
+  changed-file diagnostic pass finds only inherited warnings after those corrections.
 - The `x86-v4` result is a feature-build and runtime-selection check on this host, not proof that
   every SIMD path was forced. Non-x86 targets, Apple SME/AMX, and wasm have not been executed.
