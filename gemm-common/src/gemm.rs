@@ -1,5 +1,5 @@
 use crate::{
-    cache::{kernel_params, DivCeil, KernelParams, CACHE_INFO},
+    cache::{kernel_kc, kernel_params, DivCeil, KernelParams, CACHE_INFO},
     gemv, gevv,
     microkernel::{HMicroKernelFn, MicroKernelFn},
     pack_operands::{pack_lhs, pack_rhs},
@@ -292,8 +292,11 @@ fn block_params<T, const MR: usize, const NR: usize>(
     parallelism: Parallelism,
 ) -> KernelParams {
     let KernelParams { kc, mc, nc } = if m <= 64 && n <= 64 {
-        // skip expensive kernel_params call for small sizes
-        let kc = k.min(512);
+        // skip expensive kernel_params call for small sizes, but cut the depth as it does:
+        // `kc` from `k` alone, so that this branch and the other round alike
+        // (tensor4all/colmat-next-rs#45; it was `k.min(512)`, which made a <= 64 x 64 slice of a
+        // product with `k > 512` round differently from the same entries of the whole product)
+        let kc = kernel_kc(k, MR, NR, core::mem::size_of::<T>());
         let alloc = CACHE_INFO[1].cache_bytes / core::mem::size_of::<T>();
         let mc = (alloc / kc) / MR * MR;
 

@@ -656,33 +656,24 @@ fn round_down(a: usize, b: usize) -> usize {
     a / b * b
 }
 
-pub fn kernel_params(
-    m: usize,
-    n: usize,
-    k: usize,
-    mr: usize,
-    nr: usize,
-    sizeof: usize,
-) -> KernelParams {
-    if m == 0 || n == 0 || k == 0 {
-        return KernelParams {
-            kc: k,
-            mc: m,
-            nc: n,
-        };
+/// The blocking depth `kc` for a product of depth `k` with register blocks of `mr x nr` and
+/// elements of `sizeof` bytes. It depends on `k`, the kernel and the caches only, never on `m`
+/// or `n`: the depth is cut into the same chunks whatever the shape of the output, so a row or
+/// column slice of a product rounds exactly as the same rows or columns of the whole product
+/// (tensor4all/colmat-next-rs#45).
+pub fn kernel_kc(k: usize, mr: usize, nr: usize, sizeof: usize) -> usize {
+    if k == 0 {
+        return 0;
     }
 
     let info = *CACHE_INFO;
 
     let l1_cache_bytes = info[0].cache_bytes.max(32 * 1024);
     let l2_cache_bytes = info[1].cache_bytes;
-    let l3_cache_bytes = info[2].cache_bytes;
 
     let l1_line_bytes = info[0].cache_line_bytes.max(64);
 
     let l1_assoc = info[0].associativity.max(2);
-    let l2_assoc = info[1].associativity.max(2);
-    let l3_assoc = info[2].associativity.max(2);
 
     let l1_n_sets = l1_cache_bytes / (l1_line_bytes * l1_assoc);
 
@@ -728,7 +719,34 @@ pub fn kernel_params(
         .max(kc_l2)
         .min(k);
     let k_iter = k.msrv_div_ceil(auto_kc);
-    let auto_kc = k.msrv_div_ceil(k_iter);
+    k.msrv_div_ceil(k_iter)
+}
+
+pub fn kernel_params(
+    m: usize,
+    n: usize,
+    k: usize,
+    mr: usize,
+    nr: usize,
+    sizeof: usize,
+) -> KernelParams {
+    if m == 0 || n == 0 || k == 0 {
+        return KernelParams {
+            kc: k,
+            mc: m,
+            nc: n,
+        };
+    }
+
+    let info = *CACHE_INFO;
+
+    let l2_cache_bytes = info[1].cache_bytes;
+    let l3_cache_bytes = info[2].cache_bytes;
+
+    let l2_assoc = info[1].associativity.max(2);
+    let l3_assoc = info[2].associativity.max(2);
+
+    let auto_kc = kernel_kc(k, mr, nr, sizeof);
 
     // l2 cache must hold
     //  - B micropanel: nr×kc: assume 1 assoc degree
