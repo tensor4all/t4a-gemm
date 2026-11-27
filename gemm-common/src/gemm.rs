@@ -1,3 +1,8 @@
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+mod square_f64;
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+pub use square_f64::try_gemm_square_f64;
+
 use crate::{
     cache::{kernel_kc, kernel_params, DivCeil, KernelParams, CACHE_INFO},
     gemv, gevv,

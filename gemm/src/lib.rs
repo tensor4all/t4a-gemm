@@ -9,6 +9,8 @@ pub use crate::gemm::{c32, c64, gemm, gemm_scratch, gemm_with_stack};
 /// The `dyn-stack` version of [`gemm_with_stack`]'s `stack` and [`gemm_scratch`]'s result.
 pub use gemm_common::dyn_stack;
 pub use gemm_common::Parallelism;
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+pub use gemm_common::gemm::try_gemm_square_f64;
 
 pub use gemm_common::gemm::{
     get_lhs_packing_threshold_multi_thread, get_lhs_packing_threshold_single_thread,
