@@ -43,12 +43,16 @@ pub unsafe fn try_gemm_square_f64(
     true
 }
 
+// Eight doubles per rank. The extra cache line at 512 separates adjacent panels.
+const fn panel_stride(k: usize) -> usize {
+    8 * k + if k == 512 { 8 } else { 0 }
+}
+
 #[target_feature(enable = "avx2,fma")]
 unsafe fn square<const K: usize>(a: *const f64, b: *const f64, c: *mut f64) {
     #[cfg(debug_assertions)]
     debug_assert!((511..=513).contains(&K));
-    // Eight doubles per rank. At 512 the extra cache line separates adjacent panels.
-    let sa = 8 * K + usize::from(K == 512) * 8;
+    let sa = panel_stride(K);
     let packed_len = K.div_ceil(8) * sa;
     let req = StackReq::new_aligned::<f64>(packed_len, 64);
     let mut mem = PackBuffer::take(req);
@@ -176,31 +180,16 @@ unsafe fn square<const K: usize>(a: *const f64, b: *const f64, c: *mut f64) {
                 let source = a0.add(future * 8 + depth * K);
                 let target = packed.add(future * sa + depth * 8);
                 let siblings = if K == 512 {
-                    copy_sibling_tiles::<2, false>(
-                        K, slab, right, out, sa, K as isize, K as isize, copied, source, target,
-                    )
+                    copy_sibling_tiles::<K, 2, false>(slab, right, out, copied, source, target)
                 } else {
-                    copy_sibling_tiles::<4, true>(
-                        K, slab, right, out, sa, K as isize, K as isize, copied, source, target,
-                    )
+                    copy_sibling_tiles::<K, 4, true>(slab, right, out, copied, source, target)
                 };
                 if siblings < copied {
                     let pa = slab.add(siblings * sa);
                     let pd = out.add(siblings * 8);
                     let src = source.add(siblings * 8);
                     let to = target.add(siblings * sa);
-                    copy_sibling_tiles::<1, false>(
-                        K,
-                        pa,
-                        right,
-                        pd,
-                        sa,
-                        K as isize,
-                        K as isize,
-                        copied - siblings,
-                        src,
-                        to,
-                    );
+                    copy_sibling_tiles::<K, 1, false>(pa, right, pd, copied - siblings, src, to);
                 }
                 if part == 7 {
                     for d in K / 8 * 8..K {
@@ -504,27 +493,26 @@ unsafe fn depth_loop_tile(
 }
 
 #[target_feature(enable = "avx2,fma")]
-unsafe fn copy_sibling_tiles<const W: usize, const EARLY: bool>(
-    k: usize,
+unsafe fn copy_sibling_tiles<const K: usize, const W: usize, const EARLY: bool>(
     a: *const f64,
     b: *const f64,
     c: *mut f64,
-    sa: usize,
-    sb: isize,
-    sc: isize,
     count: usize,
     source: *const f64,
     target: *mut f64,
 ) -> usize {
     use core::arch::x86_64::*;
+    let sa = panel_stride(K);
+    let sb = K as isize;
+    let sc = K as isize;
     let copied = count / W * W;
-    let bulk = k / 8 * 8;
-    let span = k / 8 / W;
+    let bulk = K / 8 * 8;
+    let span = K / 8 / W;
     let end = b.wrapping_add(bulk);
     for panel in 0..copied {
         let start = panel / W * W;
         let depth = panel % W * span;
-        let src = source.add(start * 8 + depth * k);
+        let src = source.add(start * 8 + depth * K);
         let wr = target.add(start * sa + depth * 8);
         let left = a.add(panel * sa);
         let dst = c.add(panel * 8);
@@ -587,9 +575,9 @@ unsafe fn copy_sibling_tiles<const W: usize, const EARLY: bool>(
             "jnz 4b",
             "5:",
             width=const W,early=const (EARLY as usize),mask=const (64*(W-1)),
-            a=inout(reg) left=>_,idx=inout(reg) (-(bulk as isize)*8)=>_,tail=inout(reg) (k-bulk)=>_,
-            src=inout(reg) src=>_,wr=inout(reg) wr=>_,stride=in(reg) (sa*8),
-            back=in(reg) (64isize-(W*sa*8) as isize),srcstride=in(reg) (k*8),
+            a=inout(reg) left=>_,idx=inout(reg) (-(bulk as isize)*8)=>_,tail=inout(reg) (K-bulk)=>_,
+            src=inout(reg) src=>_,wr=inout(reg) wr=>_,stride=const (panel_stride(K)*8),
+            back=const (64isize-(W*panel_stride(K)*8) as isize),srcstride=const (K*8),
             b0=in(reg) end.wrapping_offset(0*sb),
             b1=in(reg) end.wrapping_offset(1*sb),
             b2=in(reg) end.wrapping_offset(2*sb),
@@ -611,9 +599,9 @@ unsafe fn copy_sibling_tiles<const W: usize, const EARLY: bool>(
         _mm256_storeu_pd(dst.offset(4 * sc).add(4), v9);
         _mm256_storeu_pd(dst.offset(5 * sc).add(0), v10);
         _mm256_storeu_pd(dst.offset(5 * sc).add(4), v11);
-        for rem in (span * W)..k / 8 {
+        for rem in (span * W)..K / 8 {
             core::ptr::copy_nonoverlapping(
-                source.add(panel * 8 + rem * k),
+                source.add(panel * 8 + rem * K),
                 target.add(panel * sa + rem * 8),
                 8,
             );
