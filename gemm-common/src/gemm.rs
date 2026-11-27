@@ -2,7 +2,7 @@ use crate::{
     cache::{kernel_kc, kernel_params, DivCeil, KernelParams, CACHE_INFO},
     gemv, gevv,
     microkernel::{HMicroKernelFn, MicroKernelFn},
-    pack_operands::{pack_lhs, pack_rhs},
+    pack_operands::PackOperand,
     simd::MixedSimd,
     Parallelism, Ptr,
 };
@@ -390,7 +390,8 @@ pub unsafe fn gemm_basic_generic<
         + core::ops::Add<Output = T>
         + core::ops::Mul<Output = T>
         + core::cmp::PartialEq
-        + 'static,
+        + 'static
+        + PackOperand<T>,
     const N: usize,
     const MR: usize,
     const NR: usize,
@@ -477,7 +478,8 @@ pub unsafe fn gemm_basic_generic_with_stack<
         + core::ops::Add<Output = T>
         + core::ops::Mul<Output = T>
         + core::cmp::PartialEq
-        + 'static,
+        + 'static
+        + PackOperand<T>,
     const N: usize,
     const MR: usize,
     const NR: usize,
@@ -644,6 +646,79 @@ pub unsafe fn gemm_basic_generic_with_stack<
         }
     }
 
+    gemm_blocked_generic_with_stack::<S, T, T, T, N, MR, NR, MR_DIV_N>(
+        simd,
+        m,
+        n,
+        k,
+        dst,
+        dst_cs,
+        dst_rs,
+        lhs,
+        lhs_cs,
+        lhs_rs,
+        rhs,
+        rhs_cs,
+        rhs_rs,
+        alpha,
+        beta,
+        conj_dst,
+        conj_lhs,
+        conj_rhs,
+        dispatcher,
+        _requires_row_major_rhs,
+        parallelism,
+        stack,
+    )
+}
+
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub unsafe fn gemm_blocked_generic_with_stack<
+    S: MixedSimd<T, T, T, T>,
+    Lhs: PackOperand<T>,
+    Rhs: PackOperand<T>,
+    T: Copy
+        + Zero
+        + One
+        + Conj
+        + Send
+        + Sync
+        + core::fmt::Debug
+        + core::ops::Add<Output = T>
+        + core::ops::Mul<Output = T>
+        + core::cmp::PartialEq
+        + 'static
+        + PackOperand<T>,
+    const N: usize,
+    const MR: usize,
+    const NR: usize,
+    const MR_DIV_N: usize,
+>(
+    simd: S,
+    m: usize,
+    n: usize,
+    k: usize,
+    dst: *mut T,
+    dst_cs: isize,
+    dst_rs: isize,
+    lhs: *const Lhs,
+    lhs_cs: isize,
+    lhs_rs: isize,
+    rhs: *const Rhs,
+    rhs_cs: isize,
+    rhs_rs: isize,
+    alpha: T,
+    beta: T,
+    conj_dst: bool,
+    conj_lhs: bool,
+    conj_rhs: bool,
+    dispatcher: &[[MicroKernelFn<T>; NR]; MR_DIV_N],
+    _requires_row_major_rhs: bool,
+    parallelism: Parallelism,
+    stack: Option<&mut dyn_stack::MemStack>,
+) {
     let params = block_params::<T, MR, NR>(m, n, k, parallelism);
     let KernelParams { kc, mc, nc } = params;
 
@@ -653,8 +728,10 @@ pub unsafe fn gemm_basic_generic_with_stack<
     let packed_lhs_stride = kc * MR;
 
     let dst = Ptr(dst);
-    let lhs = Ptr(lhs as *mut T);
-    let rhs = Ptr(rhs as *mut T);
+    let lhs = Ptr(lhs as *mut Lhs);
+    let rhs = Ptr(rhs as *mut Rhs);
+    let pack_lhs_required = core::any::TypeId::of::<Lhs>() != core::any::TypeId::of::<T>();
+    let pack_rhs_required = core::any::TypeId::of::<Rhs>() != core::any::TypeId::of::<T>();
 
     #[cfg(feature = "rayon")]
     let max_threads = match parallelism {
@@ -683,11 +760,13 @@ pub unsafe fn gemm_basic_generic_with_stack<
     };
 
     #[cfg(target_arch = "aarch64")]
-    let do_pack_rhs = _requires_row_major_rhs || m > get_rhs_packing_threshold() * MR;
+    let do_pack_rhs =
+        pack_rhs_required || _requires_row_major_rhs || m > get_rhs_packing_threshold() * MR;
 
     // no need to pack if the lhs is already contiguous-ish
     #[cfg(not(target_arch = "aarch64"))]
-    let do_pack_rhs = (rhs_rs.unsigned_abs() != 1 && m > 2 * MR)
+    let do_pack_rhs = pack_rhs_required
+        || (rhs_rs.unsigned_abs() != 1 && m > 2 * MR)
         || (rhs_rs.unsigned_abs() == 1 && m > get_rhs_packing_threshold() * MR);
     let do_prepack_lhs = m <= 2 * mc && ((m % N != 0) || lhs_rs != 1);
 
@@ -849,7 +928,7 @@ pub unsafe fn gemm_basic_generic_with_stack<
                     // on aarch64 we want the registers to be fully initialized
                     // for use with neon/amx
                     #[cfg(target_arch = "aarch64")]
-                    pack_rhs::<T, N, NR, _>(
+                    Rhs::pack_rhs::<S, N, NR>(
                         simd,
                         n_chunk,
                         k_chunk,
@@ -862,7 +941,7 @@ pub unsafe fn gemm_basic_generic_with_stack<
                         packed_rhs_stride,
                     );
                     #[cfg(not(target_arch = "aarch64"))]
-                    pack_rhs::<T, 1, NR, _>(
+                    Rhs::pack_rhs::<S, 1, NR>(
                         simd,
                         n_chunk,
                         k_chunk,
@@ -901,7 +980,7 @@ pub unsafe fn gemm_basic_generic_with_stack<
 
                             if ncols > 0 {
                                 #[cfg(target_arch = "aarch64")]
-                                pack_rhs::<T, N, NR, _>(
+                                Rhs::pack_rhs::<S, N, NR>(
                                     simd,
                                     ncols,
                                     k_chunk,
@@ -915,7 +994,7 @@ pub unsafe fn gemm_basic_generic_with_stack<
                                     packed_rhs_stride,
                                 );
                                 #[cfg(not(target_arch = "aarch64"))]
-                                pack_rhs::<T, 1, NR, _>(
+                                Rhs::pack_rhs::<S, 1, NR>(
                                     simd,
                                     ncols,
                                     k_chunk,
@@ -940,7 +1019,7 @@ pub unsafe fn gemm_basic_generic_with_stack<
                 }
             }
             if do_prepack_lhs {
-                pack_lhs::<T, N, MR, _>(
+                Lhs::pack_lhs::<S, N, MR>(
                     simd,
                     m,
                     k_chunk,
@@ -1013,7 +1092,10 @@ pub unsafe fn gemm_basic_generic_with_stack<
                     }
 
                     let do_pack_lhs = !do_prepack_lhs
-                        && ((m_chunk % N != 0) || lhs_rs != 1 || n_chunk > packing_threshold * NR);
+                        && (pack_lhs_required
+                            || (m_chunk % N != 0)
+                            || lhs_rs != 1
+                            || n_chunk > packing_threshold * NR);
                     let packed_lhs_cs = if do_prepack_lhs || do_pack_lhs {
                         MR as isize
                     } else {
@@ -1047,7 +1129,7 @@ pub unsafe fn gemm_basic_generic_with_stack<
                                 dispatcher[(m_chunk_inner + (N - 1)) / N - 1][n_chunk_inner - 1];
 
                             if do_pack_lhs && !did_pack_lhs[i] {
-                                pack_lhs::<T, N, MR, _>(
+                                Lhs::pack_lhs::<S, N, MR>(
                                     simd,
                                     m_chunk_inner,
                                     k_chunk,
@@ -1063,6 +1145,8 @@ pub unsafe fn gemm_basic_generic_with_stack<
                                 did_pack_lhs[i] = true;
                             }
 
+                            // SAFETY: every source type different from `T` is forced through
+                            // packing above, so a direct source pointer is a valid `T` pointer.
                             func(
                                 m_chunk_inner,
                                 n_chunk_inner,
@@ -1079,7 +1163,7 @@ pub unsafe fn gemm_basic_generic_with_stack<
                                         (row_outer + row_inner) as isize * lhs_rs
                                             + depth_outer as isize * lhs_cs,
                                     )
-                                    .0
+                                    .0 as *const T
                                 },
                                 if do_pack_rhs {
                                     packed_rhs.wrapping_add(j * packed_rhs_stride).0
@@ -1088,7 +1172,7 @@ pub unsafe fn gemm_basic_generic_with_stack<
                                         depth_outer as isize * rhs_rs
                                             + (col_outer + col_inner) as isize * rhs_cs,
                                     )
-                                    .0
+                                    .0 as *const T
                                 },
                                 dst_cs,
                                 dst_rs,

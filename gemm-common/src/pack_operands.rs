@@ -301,3 +301,179 @@ pub unsafe fn pack_rhs<T: Copy, const N: usize, const NR: usize, S: Simd>(
         || pack_generic::<T, N, NR>(n, k, dst, src, src_rs, src_cs, dst_stride),
     );
 }
+
+mod pack_sealed {
+    pub trait Sealed {}
+    impl Sealed for f32 {}
+    impl Sealed for f64 {}
+    impl Sealed for crate::gemm::c32 {}
+    impl Sealed for crate::gemm::c64 {}
+    #[cfg(feature = "f16")]
+    impl Sealed for half::f16 {}
+}
+
+#[doc(hidden)]
+pub trait PackOperand<T>: pack_sealed::Sealed + Copy + Send + Sync + 'static {
+    // INVARIANT: this is the existing packer ABI; identity and converting packers must share
+    // the same argument order so the blocked driver makes no per-call dispatch decision.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn pack_lhs<S: Simd, const N: usize, const MR: usize>(
+        simd: S,
+        m: usize,
+        k: usize,
+        dst: crate::Ptr<T>,
+        src: crate::Ptr<Self>,
+        src_cs: isize,
+        src_rs: isize,
+        dst_stride: usize,
+    );
+
+    // INVARIANT: this is the existing packer ABI; identity and converting packers must share
+    // the same argument order so the blocked driver makes no per-call dispatch decision.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn pack_rhs<S: Simd, const N: usize, const NR: usize>(
+        simd: S,
+        n: usize,
+        k: usize,
+        dst: crate::Ptr<T>,
+        src: crate::Ptr<Self>,
+        src_cs: isize,
+        src_rs: isize,
+        dst_stride: usize,
+    );
+}
+
+macro_rules! impl_pack_operand_identity {
+    ($($ty:ty),* $(,)?) => {
+        $(
+            impl PackOperand<$ty> for $ty {
+                #[inline(always)]
+                unsafe fn pack_lhs<S: Simd, const N: usize, const MR: usize>(
+                    simd: S,
+                    m: usize,
+                    k: usize,
+                    dst: crate::Ptr<$ty>,
+                    src: crate::Ptr<Self>,
+                    src_cs: isize,
+                    src_rs: isize,
+                    dst_stride: usize,
+                ) {
+                    unsafe {
+                        self::pack_lhs::<$ty, N, MR, S>(
+                            simd, m, k, dst, src, src_cs, src_rs, dst_stride,
+                        )
+                    }
+                }
+
+                #[inline(always)]
+                unsafe fn pack_rhs<S: Simd, const N: usize, const NR: usize>(
+                    simd: S,
+                    n: usize,
+                    k: usize,
+                    dst: crate::Ptr<$ty>,
+                    src: crate::Ptr<Self>,
+                    src_cs: isize,
+                    src_rs: isize,
+                    dst_stride: usize,
+                ) {
+                    unsafe {
+                        self::pack_rhs::<$ty, N, NR, S>(
+                            simd, n, k, dst, src, src_cs, src_rs, dst_stride,
+                        )
+                    }
+                }
+            }
+        )*
+    };
+}
+
+impl_pack_operand_identity!(f32, f64, crate::gemm::c32, crate::gemm::c64);
+#[cfg(feature = "f16")]
+impl_pack_operand_identity!(half::f16);
+
+#[inline(always)]
+unsafe fn pack_convert_inner_loop<Src: Copy + Into<T>, T: Copy, const DST_WIDTH: usize>(
+    mut dst: *mut T,
+    mut src: *const Src,
+    src_rs: isize,
+    src_cs: isize,
+    src_width: usize,
+    k: usize,
+) {
+    for _ in 0..k {
+        for j in 0..src_width {
+            *dst.add(j) = (*src.offset(j as isize * src_rs)).into();
+        }
+        quick_zero::<T>(core::slice::from_raw_parts_mut(
+            dst.add(src_width) as _,
+            DST_WIDTH - src_width,
+        ));
+        src = src.wrapping_offset(src_cs);
+        dst = dst.add(DST_WIDTH);
+    }
+}
+
+#[inline(always)]
+unsafe fn pack_convert<Src: Copy + Into<T>, T: Copy, const DST_WIDTH: usize>(
+    m: usize,
+    k: usize,
+    mut dst: *mut T,
+    mut src: *const Src,
+    src_cs: isize,
+    src_rs: isize,
+    dst_stride: usize,
+) {
+    let m_width = m / DST_WIDTH * DST_WIDTH;
+    let mut i = 0;
+    while i < m_width {
+        pack_convert_inner_loop::<Src, T, DST_WIDTH>(dst, src, src_rs, src_cs, DST_WIDTH, k);
+        src = src.wrapping_offset(src_rs * DST_WIDTH as isize);
+        dst = dst.add(dst_stride);
+        i += DST_WIDTH;
+    }
+    if i < m {
+        pack_convert_inner_loop::<Src, T, DST_WIDTH>(dst, src, src_rs, src_cs, m - i, k);
+    }
+}
+
+impl PackOperand<f64> for f32 {
+    #[inline(never)]
+    unsafe fn pack_lhs<S: Simd, const N: usize, const MR: usize>(
+        _: S,
+        m: usize,
+        k: usize,
+        dst: crate::Ptr<f64>,
+        src: crate::Ptr<Self>,
+        src_cs: isize,
+        src_rs: isize,
+        dst_stride: usize,
+    ) {
+        let dst = dst.0;
+        let src = src.0;
+        S::vectorize(
+            #[inline(always)]
+            || pack_convert::<Self, f64, MR>(m, k, dst, src, src_cs, src_rs, dst_stride),
+        );
+    }
+
+    #[inline(never)]
+    unsafe fn pack_rhs<S: Simd, const N: usize, const NR: usize>(
+        _: S,
+        n: usize,
+        k: usize,
+        dst: crate::Ptr<f64>,
+        src: crate::Ptr<Self>,
+        src_cs: isize,
+        src_rs: isize,
+        dst_stride: usize,
+    ) {
+        let dst = dst.0;
+        let src = src.0;
+        // Match the homogeneous RHS orientation: depth advances by the original `src_rs`,
+        // while each packed N-wide row advances by the original `src_cs`.
+        S::vectorize(
+            #[inline(always)]
+            || pack_convert::<Self, f64, NR>(n, k, dst, src, src_rs, src_cs, dst_stride),
+        );
+    }
+}

@@ -164,8 +164,35 @@ nothing, a thread's first call and products larger than L2 included.
   `gemm::gemm_basic_generic_with_stack`, `gemm::gemm_scratch_generic` and the re-export of
   `dyn_stack`; in each `gemm_def!`/`gemm_cplx_def!` module, `get_gemm_with_stack_fn` and
   `gemm_scratch` next to `get_gemm_fn`, whose type is unchanged.
+- `gemm::MixedRealGemmToF64`, `gemm::gemm_mixed`, `gemm::gemm_mixed_scratch` and
+  `gemm::gemm_mixed_with_stack` (change 7).
 
 The benchmark harness (`gemm/benches/bench.rs`) is unchanged from upstream.
+
+### 7. Mixed real input with f64 destination and arithmetic
+
+`gemm_mixed` supports exactly `f32 x f32 -> f64` and `f32 x f64 -> f64`, with the sealed
+`MixedRealGemmToF64` marker rejecting every other pair at compile time. Its scalar convention is the
+same as `gemm`: `dst := alpha * dst + beta * lhs * rhs`, with `alpha` and `beta` in `f64`; old output
+is not read when `read_dst` is false. Zero-depth calls apply only the old-output rule.
+
+Each `f32` source value is converted exactly once per packed-panel instance. Products and partial
+sums use `f64`, including across depth blocks; an `f32` product followed by widening is not the
+operation. Depth blocking can change the summation order, so results are **not** block-size
+independent and bitwise equality across execution routes or thread counts is not promised. Correctness
+checks use an independent naive or extended-precision reference with a stated tolerance.
+
+Mixed calls deliberately bypass homogeneous GEMV, horizontal and other early routes and reuse the
+existing `f64` microkernels. The internal dynamic dispatcher rejects an unsupported pair before any
+destination access; the public sealed API rejects one at compile time. No whole-matrix conversion
+copy or per-pair microkernel is added, and no performance claim is made.
+
+`gemm_mixed_scratch` and `gemm_mixed_with_stack` provide the corresponding caller-owned `f64`
+packing storage contract. With `Parallelism::None`, a short stack panics before destination mutation;
+with Rayon, the supplied stack is ignored. After process-wide kernel/cache initialization, a
+caller-stack call allocates no per-call working memory; the first mixed call may perform that
+initialization. The destination and inputs may have row-major, column-major, padded or reversed
+strides; mixed dispatch does not swap `f32 x f64` into an unsupported `f64 x f32` transpose.
 
 ### Which kernel a call takes
 
