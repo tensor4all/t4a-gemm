@@ -15,8 +15,8 @@ Changes 1, 2, 3 and 5 apply on every target, not only on Apple Silicon:
 
 ### 1. A larger `kc` on every target
 
-`kernel_params` (`gemm-common/src/cache.rs:721-729`) chooses how deep each `k`
-block is. Upstream takes `kc` from an L1 set-conflict formula with a floor of
+`kernel_kc` (`gemm-common/src/cache.rs:664-723`), which `kernel_params` calls,
+chooses how deep each `k` block is. Upstream takes `kc` from an L1 set-conflict formula with a floor of
 512. The fork also raises it to `l2_cache_bytes / (sizeof * (8 * mr + nr))`, the
 largest depth at which one `A` macropanel (at most `8 * mr` rows) and one `B`
 micropanel fit in L2, still capped at `k`. The change is not behind any `cfg`.
@@ -25,6 +25,15 @@ NEON, scalar and SME, and `t4a-gemm-f16`, which calls the same function
 (`gemm-f16/src/gemm.rs:380`) — whenever that bound exceeds upstream's `kc` and
 `k` is deeper than upstream's `kc`.
 
+- The same `kc` for every output shape: upstream's `block_params` skips `kernel_params` when
+  `m <= 64 && n <= 64` and takes `kc = k.min(512)` there; the fork takes `kernel_kc` in that
+  branch too (`gemm-common/src/gemm.rs:294-299`), so `kc` depends on `k`, the kernel and the
+  caches, never on `m` or `n`. A window of a product computed on its own then rounds bit for
+  bit as the same entries of the whole product, which a caller that splits a product into
+  tiles across threads relies on (tensor4all/colmat-next-rs#45;
+  `gemm/tests/shape_independent_blocking.rs`). With `k.min(512)` (upstream, and this fork
+  before this change), a `40 x 3` slice of a `257 x 3 x 513` product differed from the whole
+  product in `f32`, `f64`, `c32` and `c64` on an Apple M1 Pro.
 - Why: every extra `k` chunk costs a microkernel call plus a read-modify-write
   pass over the block. On an Apple M5 Max that was about 0.16 us, roughly 20% of
   a `kc = 512` block with the `f64` SME kernel; `n = k = 2048` at 1 thread went
@@ -44,7 +53,7 @@ is large enough (`PACK_BUF` and `PackBuffer`, `gemm-common/src/gemm.rs:59-132`).
 - Why: tenferro-rs#2448 and #2472 measured two heap allocations per call for
   small factorization-sized products on `aarch64` (`gemm-f64/tests/alloc_count.rs`).
 - The packing request is bounded by the matrix: the column block is clamped to
-  `ceil(n / NR) * NR` (`block_params`, `gemm-common/src/gemm.rs:288-325`). Upstream (and this fork before
+  `ceil(n / NR) * NR` (`block_params`, `gemm-common/src/gemm.rs:288-328`). Upstream (and this fork before
   `#17`) takes `nc` from the L3-derived blocking, and on a host that reports no L3 (Apple,
   `cache.rs`) the serial path falls back to `128 * NR` columns whatever `n` is, so a
   `60 x 300` product asked for ~4 MB of packed `rhs` where ~0.6 MB is written. The number of
