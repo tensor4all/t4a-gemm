@@ -286,6 +286,11 @@ const SHAPES: &[(usize, usize, usize)] = &[
     (300, 1, 200),
     (16, 64, 128),
     (64, 128, 64),
+    // the small-size branch of `block_params` with `k > 512`, where `kc` comes from `kernel_kc`
+    // and exceeds 512 (tensor4all/colmat-next-rs#45): the bound has to cover that depth
+    (40, 40, 1024),
+    (16, 3, 2048),
+    (64, 64, 4096),
     (37, 513, 300),
     (300, 200, 150),
     (513, 37, 700),

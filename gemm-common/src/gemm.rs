@@ -292,10 +292,14 @@ fn block_params<T, const MR: usize, const NR: usize>(
     parallelism: Parallelism,
 ) -> KernelParams {
     let KernelParams { kc, mc, nc } = if m <= 64 && n <= 64 {
-        // skip expensive kernel_params call for small sizes, but cut the depth as it does:
-        // `kc` from `k` alone, so that this branch and the other round alike
-        // (tensor4all/colmat-next-rs#45; it was `k.min(512)`, which made a <= 64 x 64 slice of a
-        // product with `k > 512` round differently from the same entries of the whole product)
+        // Skip the rest of `kernel_params` for small sizes, but never its `kc`. `kc` decides how
+        // the `k` sum of every element is grouped, so it must be the same whatever `m` and `n`
+        // are: a window of a product computed on its own must round as the same entries of the
+        // whole product (tensor4all/colmat-next-rs#45; `gemm/tests/shape_independent_blocking.rs`).
+        // `kernel_kc` already fits `kc` to the kernel and the caches, so this branch has nothing
+        // left to decide about the depth. Do not cap it here (it was `k.min(512)`, which made a
+        // <= 64 x 64 window of a product with `k > 512` round differently). Only `mc` and `nc`,
+        // which do not change the grouping, are chosen here.
         let kc = kernel_kc(k, MR, NR, core::mem::size_of::<T>());
         let alloc = CACHE_INFO[1].cache_bytes / core::mem::size_of::<T>();
         let mc = (alloc / kc) / MR * MR;
